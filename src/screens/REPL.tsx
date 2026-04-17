@@ -207,7 +207,7 @@ const getCoordinatorUserContext: (
 /* eslint-enable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
 import useCanUseTool from '../hooks/useCanUseTool.js';
 import type { ToolPermissionContext, Tool } from '../Tool.js';
-import { notifyAutomationStateChanged } from '../utils/sessionState.js';
+import { useBridgeAutomationState } from '../bridge/useBridgeAutomationState.js';
 import {
   applyPermissionUpdate,
   applyPermissionUpdates,
@@ -340,9 +340,6 @@ import { useInboxPoller } from '../hooks/useInboxPoller.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/index.js') : null;
-const PROACTIVE_NO_OP_SUBSCRIBE = (_cb: () => void) => () => {};
-const PROACTIVE_FALSE = () => false;
-const PROACTIVE_NULL = (): number | null => null;
 const SUGGEST_BG_PR_NOOP = (_p: string, _n: string): boolean => false;
 const useProactive =
   feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/useProactive.js').useProactive : null;
@@ -925,16 +922,6 @@ export function REPL({
   // Watch for skill file changes and reload all commands
   useSkillsChange(isRemoteSession ? undefined : getProjectRoot(), setLocalCommands);
 
-  // Track proactive mode for tools dependency - SleepTool filters by proactive state
-  const proactiveActive = React.useSyncExternalStore(
-    proactiveModule?.subscribeToProactiveChanges ?? PROACTIVE_NO_OP_SUBSCRIBE,
-    proactiveModule?.isProactiveActive ?? PROACTIVE_FALSE,
-  );
-  const proactiveNextTickAt = React.useSyncExternalStore<number | null>(
-    proactiveModule?.subscribeToProactiveChanges ?? PROACTIVE_NO_OP_SUBSCRIBE,
-    proactiveModule?.getNextTickAt ?? PROACTIVE_NULL,
-  );
-
   // BriefTool.isEnabled() reads getUserMsgOptIn() from bootstrap state, which
   // /brief flips mid-session alongside isBriefOnly. The memo below needs a
   // React-visible dep to re-run getTools() when that happens; isBriefOnly is
@@ -942,11 +929,6 @@ export function REPL({
   // /brief mid-session leaves the stale tool list (no SendUserMessage) and
   // the model emits plain text the brief filter hides.
   const isBriefOnly = useAppState(s => s.isBriefOnly);
-
-  const localTools = useMemo(
-    () => getTools(toolPermissionContext),
-    [toolPermissionContext, proactiveActive, isBriefOnly],
-  );
 
   useKickOffCheckAndDisableBypassPermissionsIfNeeded();
   useKickOffCheckAndDisableAutoModeIfNeeded();
@@ -1390,6 +1372,18 @@ export function REPL({
   // is null, treat as not-showing so TextInput focus and queue processor
   // aren't deadlocked by a phantom overlay.
   const isShowingLocalJSXCommand = toolJSX?.isLocalJSXCommand === true && toolJSX?.jsx != null;
+  const proactiveActive = useBridgeAutomationState({
+    proactiveModule,
+    isLoading,
+    queuedCommandsLength: queuedCommands.length,
+    hasActiveLocalJsxUI: isShowingLocalJSXCommand,
+    isInPlanMode: toolPermissionContext.mode === 'plan',
+    hasInitialMessage: initialMessage !== null,
+  });
+  const localTools = useMemo(
+    () => getTools(toolPermissionContext),
+    [toolPermissionContext, proactiveActive, isBriefOnly],
+  );
   const titleIsAnimating = isLoading && !isWaitingForApproval && !isShowingLocalJSXCommand;
   // Title animation state lives in <AnimatedTerminalTitle> so the 960ms tick
   // doesn't re-render REPL. titleDisabled/terminalTitle are still computed
@@ -4949,48 +4943,6 @@ export function REPL({
     isInPlanMode: toolPermissionContext.mode === 'plan',
     onQueueTick: (command: QueuedCommand) => enqueue(command),
   });
-
-  useEffect(() => {
-    if (!proactiveActive) {
-      notifyAutomationStateChanged(null);
-      return;
-    }
-
-    if (isLoading) {
-      return;
-    }
-
-    if (
-      proactiveNextTickAt !== null &&
-      queuedCommands.length === 0 &&
-      !isShowingLocalJSXCommand &&
-      toolPermissionContext.mode !== 'plan' &&
-      initialMessage === null
-    ) {
-      notifyAutomationStateChanged({
-        enabled: true,
-        phase: 'standby',
-        next_tick_at: proactiveNextTickAt,
-        sleep_until: null,
-      });
-      return;
-    }
-
-    notifyAutomationStateChanged({
-      enabled: true,
-      phase: null,
-      next_tick_at: null,
-      sleep_until: null,
-    });
-  }, [
-    initialMessage,
-    isLoading,
-    isShowingLocalJSXCommand,
-    proactiveActive,
-    proactiveNextTickAt,
-    queuedCommands.length,
-    toolPermissionContext.mode,
-  ]);
 
   // Abort the current operation when a 'now' priority message arrives
   // (e.g. from a chat UI client via UDS).

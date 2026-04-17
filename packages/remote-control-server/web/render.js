@@ -11,7 +11,7 @@ import {
   shouldHideAutomationUserEvent,
   shouldStartAutomationWorkFromUserEvent,
 } from "./automation.js";
-import { applyTaskStateEvent, processAssistantEvent } from "./task-panel.js";
+import { applyTaskStateEvent, processAssistantEvent, resetTaskState } from "./task-panel.js";
 
 // ============================================================
 // Replay state — tracks unresolved permission requests during history replay
@@ -104,8 +104,18 @@ export function isConversationClearedStatus(payload) {
 }
 
 function clearTranscriptView() {
+  if (typeof document === "undefined") {
+    removeLoading();
+    resetReplayState();
+    return;
+  }
+
   const stream = document.getElementById("event-stream");
-  if (!stream) return;
+  if (!stream) {
+    removeLoading();
+    resetReplayState();
+    return;
+  }
 
   let preservedClearCommand = null;
   for (let i = stream.children.length - 1; i >= 0; i -= 1) {
@@ -130,6 +140,11 @@ function clearTranscriptView() {
 
   removeLoading();
   resetReplayState();
+}
+
+export function handleConversationCleared() {
+  clearTranscriptView();
+  resetTaskState();
 }
 
 /** After replay finishes, render any still-unresolved permission prompts */
@@ -383,7 +398,7 @@ export function appendEvent(data, { replay = false } = {}) {
         return;
       case "status":
         if (isConversationClearedStatus(payload)) {
-          clearTranscriptView();
+          handleConversationCleared();
         }
         return;
       case "tool_use":
@@ -540,7 +555,7 @@ export function appendEvent(data, { replay = false } = {}) {
     case "status":
       // Skip connecting/waiting status noise from bridge
       if (isConversationClearedStatus(payload)) {
-        clearTranscriptView();
+        handleConversationCleared();
         return;
       }
       {

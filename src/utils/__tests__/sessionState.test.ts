@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
+import { notifyAutomationStateChanged } from '../../bridge/automationStateMetadata.js'
 import {
-  notifyAutomationStateChanged,
   notifySessionStateChanged,
   notifySessionMetadataChanged,
   resetSessionStateForTests,

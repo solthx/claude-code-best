@@ -535,9 +535,10 @@ export function getCommandsByMaxPriority(
  * Returns true if the command is a slash command that should be routed through
  * processSlashCommand rather than sent to the model as text.
  *
- * Commands with `skipSlashCommands` are usually treated as plain text, except
- * Remote Control bridge messages (`bridgeOrigin`) that are re-validated later
- * through isBridgeSafeCommand().
+ * Commands with `skipSlashCommands` (e.g. bridge/CCR messages) are NOT treated
+ * as slash commands — their text is meant for the model. bridge-originated
+ * messages are the exception: they are re-validated later through the bridge
+ * command policy before any slash-command handling is allowed.
  */
 export function isSlashCommand(cmd: QueuedCommand): boolean {
   return (

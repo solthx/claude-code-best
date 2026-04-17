@@ -100,5 +100,20 @@ function parseBridgePermissionResponse(
   return null
 }
 
-export { isBridgePermissionResponse, parseBridgePermissionResponse }
+function normalizeBridgePermissionResponse(
+  message: SDKControlResponse,
+): BridgePermissionResponse {
+  return (
+    parseBridgePermissionResponse(message) ?? {
+      behavior: 'deny',
+      message: 'Received an invalid Remote Control permission response.',
+    }
+  )
+}
+
+export {
+  isBridgePermissionResponse,
+  normalizeBridgePermissionResponse,
+  parseBridgePermissionResponse,
+}
 export type { BridgePermissionCallbacks, BridgePermissionResponse }

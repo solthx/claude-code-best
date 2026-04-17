@@ -1,12 +1,14 @@
-import { feature } from 'bun:bundle'
 import { z } from 'zod/v4'
 import type { ToolResultBlockParam } from 'src/Tool.js'
 import { buildTool } from 'src/Tool.js'
 import { lazySchema } from 'src/utils/lazySchema.js'
-import { notifyAutomationStateChanged } from 'src/utils/sessionState.js'
 import { SLEEP_TOOL_NAME, DESCRIPTION, SLEEP_TOOL_PROMPT } from './prompt.js'
-
-const SLEEP_WAKE_CHECK_INTERVAL_MS = 500
+import {
+  notifySleepFinished,
+  notifySleepStarted,
+  shouldInterruptSleep,
+  waitForSleepCompletion,
+} from './sleepControl.js'
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
@@ -21,36 +23,6 @@ type InputSchema = ReturnType<typeof inputSchema>
 type SleepInput = z.infer<InputSchema>
 
 type SleepOutput = { slept_seconds: number; interrupted: boolean }
-
-function isProactiveAutomationEnabled(): boolean {
-  if (!(feature('PROACTIVE') || feature('KAIROS'))) {
-    return false
-  }
-
-  const mod =
-    require('src/proactive/index.js') as typeof import('src/proactive/index.js')
-  return mod.isProactiveActive()
-}
-
-function isProactiveSleepAllowed(): boolean {
-  if (!(feature('PROACTIVE') || feature('KAIROS'))) {
-    return true
-  }
-
-  const mod =
-    require('src/proactive/index.js') as typeof import('src/proactive/index.js')
-  return mod.isProactiveActive()
-}
-
-function hasQueuedWakeSignal(): boolean {
-  const queue =
-    require('src/utils/messageQueueManager.js') as typeof import('src/utils/messageQueueManager.js')
-  return queue.hasCommandsInQueue()
-}
-
-function shouldInterruptSleep(): boolean {
-  return !isProactiveSleepAllowed() || hasQueuedWakeSignal()
-}
 
 export const SleepTool = buildTool({
   name: SLEEP_TOOL_NAME,
@@ -103,8 +75,10 @@ export const SleepTool = buildTool({
   },
 
   async call(input: SleepInput, context) {
-    // Don't enter sleep if proactive was disabled or new work arrived while
-    // the model was deciding to wait.
+    // Refuse to sleep when proactive mode is off — prevents the model from
+    // re-issuing Sleep after an interruption caused by /proactive disable.
+    // Also wake early when new work reaches the shared queue so the user does
+    // not wait for the full timer after a remote command arrives.
     if (shouldInterruptSleep()) {
       return {
         data: {
@@ -118,70 +92,10 @@ export const SleepTool = buildTool({
     const startTime = Date.now()
     const sleepUntil = startTime + duration_seconds * 1000
 
-    if (isProactiveAutomationEnabled()) {
-      notifyAutomationStateChanged({
-        enabled: true,
-        phase: 'sleeping',
-        next_tick_at: null,
-        sleep_until: sleepUntil,
-      })
-    }
+    notifySleepStarted(sleepUntil)
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        let timer: ReturnType<typeof setTimeout> | null = null
-        let wakeCheck: ReturnType<typeof setInterval> | null = null
-        let settled = false
-
-        const cleanup = () => {
-          if (timer !== null) {
-            clearTimeout(timer)
-            timer = null
-          }
-          if (wakeCheck !== null) {
-            clearInterval(wakeCheck)
-            wakeCheck = null
-          }
-          context.abortController.signal.removeEventListener('abort', onAbort)
-        }
-
-        const finish = () => {
-          if (settled) return
-          settled = true
-          cleanup()
-          resolve()
-        }
-
-        const interrupt = () => {
-          if (settled) return
-          settled = true
-          cleanup()
-          reject(new Error('interrupted'))
-        }
-
-        const onAbort = () => {
-          interrupt()
-        }
-
-        timer = setTimeout(finish, duration_seconds * 1000)
-
-        // Abort via user interrupt
-        if (context.abortController.signal.aborted) {
-          interrupt()
-          return
-        }
-        context.abortController.signal.addEventListener('abort', onAbort, {
-          once: true,
-        })
-
-        // Poll proactive state and the shared command queue so new work can
-        // wake Sleep without waiting for the full duration.
-        wakeCheck = setInterval(() => {
-          if (shouldInterruptSleep()) {
-            interrupt()
-          }
-        }, SLEEP_WAKE_CHECK_INTERVAL_MS)
-      })
+      await waitForSleepCompletion(duration_seconds, context.abortController)
       return {
         data: {
           slept_seconds: duration_seconds,
@@ -197,16 +111,7 @@ export const SleepTool = buildTool({
         },
       }
     } finally {
-      notifyAutomationStateChanged(
-        isProactiveAutomationEnabled()
-          ? {
-              enabled: true,
-              phase: null,
-              next_tick_at: null,
-              sleep_until: null,
-            }
-          : null,
-      )
+      notifySleepFinished()
     }
   },
 })

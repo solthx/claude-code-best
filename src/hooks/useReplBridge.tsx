@@ -1,23 +1,25 @@
 import { feature } from 'bun:bundle'
-import { type FSWatcher, watch } from 'fs'
 import React, { useCallback, useEffect, useRef } from 'react'
 import { setMainLoopModelOverride } from '../bootstrap/state.js'
 import {
   type BridgePermissionCallbacks,
   type BridgePermissionResponse,
+  normalizeBridgePermissionResponse,
   parseBridgePermissionResponse,
 } from '../bridge/bridgePermissionCallbacks.js'
+import { getBridgeCommandSafety } from '../bridge/bridgeCommandPolicy.js'
 import { handleRemoteInterrupt } from '../bridge/remoteInterruptHandling.js'
 import {
   isTranscriptResetResultReady,
   shouldDeferBridgeResult,
 } from '../bridge/bridgeResultScheduling.js'
+import { useBridgeTaskStatePublisher } from '../bridge/useBridgeTaskStatePublisher.js'
 import { buildBridgeConnectUrl } from '../bridge/bridgeStatusUtil.js'
 import { extractInboundMessageFields } from '../bridge/inboundMessages.js'
 import type { BridgeState, ReplBridgeHandle } from '../bridge/replBridge.js'
 import { setReplBridgeHandle } from '../bridge/replBridgeHandle.js'
 import type { Command } from '../commands.js'
-import { getSlashCommandToolSkills, isBridgeSafeCommand } from '../commands.js'
+import { getSlashCommandToolSkills } from '../commands.js'
 import { getRemoteSessionUrl } from '../constants/product.js'
 import { useNotifications } from '../context/notifications.js'
 import type {
@@ -43,10 +45,6 @@ import {
   createSystemMessage,
 } from '../utils/messages.js'
 import {
-  buildTaskStateMessage,
-  getTaskStateSnapshotKey,
-} from '../utils/taskStateMessage.js'
-import {
   getAutoModeUnavailableNotification,
   getAutoModeUnavailableReason,
   isAutoModeGateEnabled,
@@ -54,16 +52,7 @@ import {
   transitionPermissionMode,
 } from '../utils/permissions/permissionSetup.js'
 import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBridge.js'
-import {
-  getTaskListId,
-  getTasksDir,
-  listTasks,
-  onTasksUpdated,
-} from '../utils/tasks.js'
 import { ContentBlockParam } from '@anthropic-ai/sdk/resources'
-
-const TASK_STATE_DEBOUNCE_MS = 50
-const TASK_STATE_POLL_MS = 5000
 
 /** How long after a failure before replBridgeEnabled is auto-cleared (stops retries). */
 export const BRIDGE_FAILURE_DISMISS_MS = 10_000
@@ -277,9 +266,10 @@ export function useReplBridge(
                 uuid,
                 // skipSlashCommands stays true as defense-in-depth —
                 // processUserInputBase overrides it internally when bridgeOrigin
-                // is set AND the resolved command passes isBridgeSafeCommand.
-                // This keeps exit-word suppression and immediate-command blocks
-                // intact for any code path that checks skipSlashCommands directly.
+                // is set and the resolved command passes the bridge command
+                // policy. This keeps exit-word suppression and immediate-
+                // command blocks intact for any code path that checks
+                // skipSlashCommands directly.
                 skipSlashCommands: true,
                 bridgeOrigin: true,
               })
@@ -406,7 +396,9 @@ export function useReplBridge(
                           // advertising unsafe ones (local-jsx, unallowed local)
                           // would let mobile/web attempt them and hit errors.
                           commands:
-                            commandsRef.current.filter(isBridgeSafeCommand),
+                            commandsRef.current.filter(
+                              cmd => getBridgeCommandSafety(cmd, '').ok,
+                            ),
                           agents: state.agentDefinitions.activeAgents,
                           skills,
                           plugins: [],
@@ -482,12 +474,13 @@ export function useReplBridge(
             const parsed = parseBridgePermissionResponse(msg)
             if (!parsed) {
               logForDebugging(
-                `[bridge:repl] Ignoring unrecognized control_response request_id=${requestId}`,
+                `[bridge:repl] Rejecting invalid control_response request_id=${requestId}`,
               )
-              return
             }
             pendingPermissionHandlers.delete(requestId)
-            handler(parsed)
+            handler(
+              parsed ?? normalizeBridgePermissionResponse(msg),
+            )
           }
 
           const rawHandle = await initReplBridge({
@@ -926,85 +919,11 @@ export function useReplBridge(
     }
   }, [messages, replBridgeConnected])
 
-  useEffect(() => {
-    if (feature('BRIDGE_MODE')) {
-      if (!replBridgeSessionActive || replBridgeOutboundOnly) return
-
-      let cancelled = false
-      let debounceTimer: ReturnType<typeof setTimeout> | undefined
-      let pollTimer: ReturnType<typeof setInterval> | undefined
-      let watcher: FSWatcher | null = null
-      let watchedDir: string | null = null
-      let lastPublishedSnapshotKey: string | null = null
-      let lastPublishedHandle: ReplBridgeHandle | null = null
-
-      const rewatch = (dir: string): void => {
-        if (dir === watchedDir && watcher !== null) return
-        watcher?.close()
-        watcher = null
-        watchedDir = dir
-        try {
-          watcher = watch(dir, schedulePublish)
-          watcher.unref()
-        } catch {
-          // Writers ensure the directory exists; if it does not yet, the
-          // poll timer and in-process task signal still converge the snapshot.
-        }
-      }
-
-      const publishTaskState = async (): Promise<void> => {
-        const handle = handleRef.current
-        if (!handle) return
-
-        const taskListId = getTaskListId()
-        rewatch(getTasksDir(taskListId))
-
-        try {
-          const tasks = await listTasks(taskListId)
-          if (cancelled || handleRef.current !== handle) return
-          const snapshotKey = getTaskStateSnapshotKey(taskListId, tasks)
-          if (
-            snapshotKey === lastPublishedSnapshotKey &&
-            handle === lastPublishedHandle
-          ) {
-            return
-          }
-          handle.writeSdkMessages([buildTaskStateMessage(taskListId, tasks)])
-          lastPublishedSnapshotKey = snapshotKey
-          lastPublishedHandle = handle
-        } catch (err) {
-          logForDebugging(
-            `[bridge:repl] Failed to publish task_state: ${errorMessage(err)}`,
-            { level: 'error' },
-          )
-        }
-      }
-
-      const schedulePublish = (): void => {
-        if (debounceTimer) clearTimeout(debounceTimer)
-        debounceTimer = setTimeout(() => {
-          debounceTimer = undefined
-          void publishTaskState()
-        }, TASK_STATE_DEBOUNCE_MS)
-        debounceTimer.unref?.()
-      }
-
-      void publishTaskState()
-      const unsubscribe = onTasksUpdated(schedulePublish)
-      pollTimer = setInterval(() => {
-        void publishTaskState()
-      }, TASK_STATE_POLL_MS)
-      pollTimer.unref?.()
-
-      return () => {
-        cancelled = true
-        unsubscribe()
-        if (debounceTimer) clearTimeout(debounceTimer)
-        if (pollTimer) clearInterval(pollTimer)
-        watcher?.close()
-      }
-    }
-  }, [replBridgeSessionActive, replBridgeOutboundOnly])
+  useBridgeTaskStatePublisher({
+    handleRef,
+    replBridgeSessionActive,
+    replBridgeOutboundOnly,
+  })
 
   const sendBridgeResult = useCallback(() => {
     if (feature('BRIDGE_MODE')) {

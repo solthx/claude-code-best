@@ -10,10 +10,10 @@ import { logEvent } from 'src/services/analytics/index.js'
 import { getContentText } from 'src/utils/messages.js'
 import {
   findCommand,
-  getBridgeCommandSafety,
   getCommandName,
   type LocalJSXCommandContext,
 } from '../../commands.js'
+import { getBridgeCommandSafety } from '../../bridge/bridgeCommandPolicy.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { IDESelection } from '../../hooks/useIdeSelection.js'
 import type { SetToolJSXFn, ToolUseContext } from '../../Tool.js'
@@ -126,8 +126,8 @@ export async function processUserInput({
    */
   skipSlashCommands?: boolean
   /**
-   * When true, slash commands matching isBridgeSafeCommand() execute even
-   * though skipSlashCommands is set. See QueuedCommand.bridgeOrigin.
+   * When true, bridge-originated slash commands may execute after passing the
+   * Remote Control bridge command policy. See QueuedCommand.bridgeOrigin.
    */
   bridgeOrigin?: boolean
   /**
@@ -422,9 +422,10 @@ async function processUserInputBase(
   // Bridge-safe slash command override: mobile/web clients set bridgeOrigin
   // with skipSlashCommands still true (defense-in-depth against exit words and
   // immediate-command fast paths). Resolve the command here — if it passes
-  // isBridgeSafeCommand, clear the skip so the gate below opens. If it's a
-  // known-but-unsafe command (local-jsx UI or terminal-only), short-circuit
-  // with a helpful message rather than letting the model see raw "/config".
+  // the bridge command policy, clear the skip so the gate below opens. If
+  // it's a known-but-unsafe command (local-jsx UI or terminal-only), short-
+  // circuit with a helpful message rather than letting the model see raw
+  // "/config".
   let effectiveSkipSlash = skipSlashCommands
   if (bridgeOrigin && inputString !== null && inputString.startsWith('/')) {
     const parsed = parseSlashCommand(inputString)

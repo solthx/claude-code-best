@@ -674,7 +674,9 @@ export async function initEnvLessBridgeCore(
     // Hidden slash-command scaffolding and pure reminder wrappers should not
     // resurrect a completed turn into "running". Check eligible (pre-cap),
     // not capped: the cap may truncate to a user message even when the actual
-    // trailing message is assistant.
+    // trailing message is assistant. shouldReportRunningForMessage() preserves
+    // that rule while covering tool_result (also typed as 'user') so the init
+    // PUT does not stay on 'idle' until the next forwarded user-type message.
     const lastEligible = eligible.at(-1)
     if (lastEligible && shouldReportRunningForMessage(lastEligible)) {
       transport.reportState('running')
@@ -836,6 +838,8 @@ export async function initEnvLessBridgeCore(
       // work-starting user messages mark turn start; hidden local-command
       // scaffolding and pure reminders should not re-open a completed turn.
       // CCRClient.reportState dedupes consecutive same-state pushes.
+      // shouldReportRunningForMessages() keeps that rule while centralizing
+      // the hidden-message exclusions shared with the mid-turn init path.
       if (shouldReportRunningForMessages(filtered)) {
         transport.reportState('running')
       }

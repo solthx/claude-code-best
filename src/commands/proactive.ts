@@ -13,7 +13,6 @@ import type {
 } from '../types/command.js'
 
 const proactive = {
-  bridgeSafe: true,
   type: 'local-jsx',
   name: 'proactive',
   description: 'Toggle proactive (autonomous) mode',

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import {
   applyTaskStateEvent,
@@ -6,10 +6,15 @@ import {
   processAssistantEvent,
   resetTaskState,
 } from "./task-panel.js";
+import { handleConversationCleared, resetReplayState } from "./render.js";
+
+const originalDocument = globalThis.document;
+const originalWindow = globalThis.window;
 
 describe("task panel state", () => {
   beforeEach(() => {
     resetTaskState();
+    resetReplayState();
   });
 
   test("falls back to assistant tool_use parsing before an authoritative snapshot arrives", () => {
@@ -100,4 +105,63 @@ describe("task panel state", () => {
       hasAuthoritativeTasks: true,
     });
   });
+
+  test("conversation_cleared resets authoritative task state", () => {
+    applyTaskStateEvent({
+      task_list_id: "team-alpha",
+      tasks: [
+        {
+          id: "7",
+          subject: "Real task",
+          description: "Pulled from task list",
+          status: "pending",
+          blocks: [],
+          blockedBy: [],
+        },
+      ],
+    });
+
+    globalThis.document = {
+      getElementById(id) {
+        if (id === "event-stream") {
+          return {
+            children: [],
+            appendChild() {},
+            set innerHTML(_value) {},
+          };
+        }
+        if (id === "permission-area") {
+          return {
+            innerHTML: "",
+            classList: {
+              add() {},
+            },
+          };
+        }
+        return null;
+      },
+    };
+    globalThis.window = {};
+
+    handleConversationCleared();
+
+    expect(getTaskState()).toEqual({
+      tasks: [],
+      todos: [],
+      hasAuthoritativeTasks: false,
+    });
+  });
+});
+
+afterEach(() => {
+  if (originalDocument === undefined) {
+    delete globalThis.document;
+  } else {
+    globalThis.document = originalDocument;
+  }
+  if (originalWindow === undefined) {
+    delete globalThis.window;
+    return;
+  }
+  globalThis.window = originalWindow;
 });

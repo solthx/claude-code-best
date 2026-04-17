@@ -1,6 +1,6 @@
 export type SessionState = 'idle' | 'running' | 'requires_action'
 
-import { isProactiveActive } from '../proactive/index.js'
+import type { AutomationStateMetadata } from './sessionMetadataTypes.js'
 
 /**
  * Context carried with requires_action transitions so downstream
@@ -23,15 +23,6 @@ export type RequiresActionDetails = {
   /** Raw tool input — the frontend reads from external_metadata.pending_action.input
    * to parse question options / plan content without scanning the event stream. */
   input?: Record<string, unknown>
-}
-
-export type AutomationStatePhase = 'standby' | 'sleeping'
-
-export type AutomationStateMetadata = {
-  enabled: boolean
-  phase: AutomationStatePhase | null
-  next_tick_at: number | null
-  sleep_until: number | null
 }
 
 import { isEnvTruthy } from './envUtils.js'
@@ -110,34 +101,7 @@ export function setPermissionModeChangedListener(
 
 let hasPendingAction = false
 let currentState: SessionState = 'idle'
-let currentAutomationState: AutomationStateMetadata | null = null
 let currentMetadata: SessionExternalMetadata = {}
-
-function normalizeAutomationState(
-  state: AutomationStateMetadata | null | undefined,
-): AutomationStateMetadata | null {
-  if (!state || state.enabled !== true) {
-    return null
-  }
-
-  return {
-    enabled: true,
-    phase:
-      state.phase === 'standby' || state.phase === 'sleeping'
-        ? state.phase
-        : null,
-    next_tick_at:
-      typeof state.next_tick_at === 'number' ? state.next_tick_at : null,
-    sleep_until:
-      typeof state.sleep_until === 'number' ? state.sleep_until : null,
-  }
-}
-
-function automationStateKey(
-  state: AutomationStateMetadata | null,
-): string {
-  return JSON.stringify(state)
-}
 
 function applyMetadataUpdate(
   metadata: SessionExternalMetadata,
@@ -157,13 +121,7 @@ function applyMetadataUpdate(
 }
 
 export function getSessionMetadataSnapshot(): SessionExternalMetadata {
-  const snapshot: SessionExternalMetadata = { ...currentMetadata }
-  if (currentAutomationState) {
-    snapshot.automation_state = { ...currentAutomationState }
-  } else if ('automation_state' in currentMetadata) {
-    snapshot.automation_state = currentMetadata.automation_state ?? null
-  }
-  return snapshot
+  return { ...currentMetadata }
 }
 
 export function getSessionState(): SessionState {
@@ -196,19 +154,6 @@ export function notifySessionStateChanged(
     notifySessionMetadataChanged({ task_summary: null })
   }
 
-  if (state !== 'idle') {
-    notifyAutomationStateChanged(
-      isProactiveActive()
-        ? {
-            enabled: true,
-            phase: null,
-            next_tick_at: null,
-            sleep_until: null,
-          }
-        : null,
-    )
-  }
-
   // Mirror to the SDK event stream so non-CCR consumers (scmuxd, VS Code)
   // see the same authoritative idle/running signal the CCR bridge does.
   // 'idle' fires after heldBackResult flushes — lets scmuxd flip IDLE and
@@ -234,21 +179,6 @@ export function notifySessionMetadataChanged(
   metadataListener?.(metadata)
 }
 
-export function notifyAutomationStateChanged(
-  state: AutomationStateMetadata | null | undefined,
-): void {
-  const nextState = normalizeAutomationState(state)
-  if (
-    automationStateKey(nextState) === automationStateKey(currentAutomationState)
-  ) {
-    return
-  }
-
-  currentAutomationState = nextState
-  applyMetadataUpdate({ automation_state: nextState })
-  metadataListener?.({ automation_state: nextState })
-}
-
 /**
  * Fired by onChangeAppState when toolPermissionContext.mode changes.
  * Downstream listeners (CCR external_metadata PUT, SDK status stream) are
@@ -265,6 +195,5 @@ export function resetSessionStateForTests(): void {
   permissionModeListener = null
   hasPendingAction = false
   currentState = 'idle'
-  currentAutomationState = null
   currentMetadata = {}
 }

@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { parseBridgePermissionResponse } from '../bridgePermissionCallbacks.js'
+import {
+  normalizeBridgePermissionResponse,
+  parseBridgePermissionResponse,
+} from '../bridgePermissionCallbacks.js'
 import type { SDKControlResponse } from '../../entrypoints/sdk/controlTypes.js'
 
 describe('parseBridgePermissionResponse', () => {
@@ -72,5 +75,21 @@ describe('parseBridgePermissionResponse', () => {
     } as unknown as SDKControlResponse
 
     expect(parseBridgePermissionResponse(message)).toBeNull()
+  })
+
+  test('normalizes malformed control responses into a deny result', () => {
+    const message = {
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: 'req-5',
+        response: { ok: true },
+      },
+    } as unknown as SDKControlResponse
+
+    expect(normalizeBridgePermissionResponse(message)).toEqual({
+      behavior: 'deny',
+      message: 'Received an invalid Remote Control permission response.',
+    })
   })
 })
