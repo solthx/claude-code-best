@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import "./test-markdown-runtime.js";
 import {
   applyStreamingAssistantEvent,
   createStreamingAssistantTextState,

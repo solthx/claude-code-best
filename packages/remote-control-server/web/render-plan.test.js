@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import "./test-markdown-runtime.js";
 import { formatPlanContent } from "./render.js";
 
 describe("formatPlanContent", () => {
@@ -16,8 +17,10 @@ Line two
 
     expect(html).toContain("<h2>Summary</h2>");
     expect(html).toContain("<p>Line one<br>Line two</p>");
-    expect(html).toContain("<ul><li>First item</li><li>Second item</li></ul>");
-    expect(html).toContain("<ol><li>Step one</li><li>Step two</li></ol>");
+    expect(html).toContain("<ul>");
+    expect(html).toContain("<li>First item</li>");
+    expect(html).toContain("<ol>");
+    expect(html).toContain("<li>Step one</li>");
   });
 
   test("escapes unsafe markup and preserves inline formatting plus code blocks", () => {
@@ -28,9 +31,20 @@ const markup = "<div>";
 \`\`\``);
 
     expect(html).toContain("<strong>Bold</strong>");
-    expect(html).toContain("<code");
-    expect(html).toContain("inline</code>");
-    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
-    expect(html).toContain("<pre><code>const markup = &quot;&lt;div&gt;&quot;;</code></pre>");
+    expect(html).toContain("<code>inline</code>");
+    expect(html).not.toContain("<script");
+    expect(html).not.toContain("alert(1)");
+    expect(html).toContain("<pre><code>const markup = &quot;&lt;div&gt;&quot;;");
+    expect(html).toContain("</code></pre>");
+  });
+
+  test("renders GFM tables and safe links", () => {
+    const html = formatPlanContent(`| Name | Value |
+| --- | --- |
+| Docs | [OpenAI](https://openai.com) |`);
+
+    expect(html).toContain("<table>");
+    expect(html).toContain("<th>Name</th>");
+    expect(html).toContain("<td><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://openai.com\">OpenAI</a></td>");
   });
 });

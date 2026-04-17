@@ -5,6 +5,7 @@
  */
 
 import { esc } from "./utils.js";
+import { renderMarkdownHtml } from "./markdown.js";
 import {
   extractEventText,
   renderAutomationIcon,
@@ -305,119 +306,12 @@ function insertTranscriptElement(stream, el) {
  */
 export const extractText = extractEventText;
 
-function formatInlineContent(content) {
-  let html = esc(content);
-  // Inline code: `...`
-  html = html.replace(/`([^`]+)`/g, '<code style="background:var(--bg-tool-card);padding:2px 5px;border-radius:3px;font-family:var(--font-mono);font-size:0.85em;">$1</code>');
-  // Bold: **...**
-  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  return html;
-}
-
-function formatAssistantContent(content) {
-  let html = esc(content);
-  // Code blocks: ```...```
-  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    return `<pre style="background:var(--bg-tool-card);padding:10px;border-radius:6px;overflow-x:auto;margin:6px 0;font-family:var(--font-mono);font-size:0.82rem;">${code.trim()}</pre>`;
-  });
-  html = formatInlineContent(html);
-  return html;
-}
-
-function renderPlanCodeBlock(code) {
-  return `<pre><code>${esc(code.trim())}</code></pre>`;
-}
-
-function formatPlanTextBlock(content) {
-  const blocks = [];
-  const lines = content.split(/\r?\n/);
-  let paragraph = [];
-  let listType = null;
-  let listItems = [];
-
-  function flushParagraph() {
-    if (paragraph.length === 0) return;
-    blocks.push(`<p>${paragraph.map(line => formatInlineContent(line)).join("<br>")}</p>`);
-    paragraph = [];
-  }
-
-  function flushList() {
-    if (!listType || listItems.length === 0) return;
-    blocks.push(`<${listType}>${listItems.map(item => `<li>${item}</li>`).join("")}</${listType}>`);
-    listType = null;
-    listItems = [];
-  }
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-
-    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
-    if (headingMatch) {
-      flushParagraph();
-      flushList();
-      const level = Math.min(headingMatch[1].length, 6);
-      blocks.push(`<h${level}>${formatInlineContent(headingMatch[2])}</h${level}>`);
-      continue;
-    }
-
-    const unorderedMatch = trimmed.match(/^[-*]\s+(.*)$/);
-    if (unorderedMatch) {
-      flushParagraph();
-      if (listType !== "ul") {
-        flushList();
-        listType = "ul";
-      }
-      listItems.push(formatInlineContent(unorderedMatch[1]));
-      continue;
-    }
-
-    const orderedMatch = trimmed.match(/^\d+\.\s+(.*)$/);
-    if (orderedMatch) {
-      flushParagraph();
-      if (listType !== "ol") {
-        flushList();
-        listType = "ol";
-      }
-      listItems.push(formatInlineContent(orderedMatch[1]));
-      continue;
-    }
-
-    flushList();
-    paragraph.push(trimmed);
-  }
-
-  flushParagraph();
-  flushList();
-  return blocks.join("");
-}
-
 export function formatPlanContent(content) {
-  const parts = [];
-  const codeBlockPattern = /```(\w*)\n?([\s\S]*?)```/g;
-  let lastIndex = 0;
-  let match;
+  return renderMarkdownHtml(content);
+}
 
-  while ((match = codeBlockPattern.exec(content)) !== null) {
-    const precedingText = content.slice(lastIndex, match.index);
-    if (precedingText.trim()) {
-      parts.push(formatPlanTextBlock(precedingText));
-    }
-    parts.push(renderPlanCodeBlock(match[2]));
-    lastIndex = codeBlockPattern.lastIndex;
-  }
-
-  const trailingText = content.slice(lastIndex);
-  if (trailingText.trim()) {
-    parts.push(formatPlanTextBlock(trailingText));
-  }
-
-  return parts.join("");
+function wrapMarkdownContent(content) {
+  return `<div class="markdown-content">${formatPlanContent(content)}</div>`;
 }
 
 function getUserUuid(payload) {
@@ -504,6 +398,7 @@ function removeStreamingCaret(runtime) {
 function rebuildStreamingAssistantBubble(runtime, display, { seal = false } = {}) {
   if (!runtime.bubbleEl) return;
 
+  runtime.bubbleEl.classList.remove("msg-bubble-md");
   runtime.bubbleEl.innerHTML = "";
   runtime.segmentEls = [];
   runtime.liveEl = null;
@@ -536,6 +431,7 @@ function rebuildStreamingAssistantBubble(runtime, display, { seal = false } = {}
 function syncStreamingAssistantBubble(runtime, display, { seal = false } = {}) {
   if (!runtime.bubbleEl) return;
 
+  runtime.bubbleEl.classList.remove("msg-bubble-md");
   const targetSegments = [...display.committedSegments];
   let liveText = display.liveText;
 
@@ -591,11 +487,13 @@ function sealStreamingAssistantRow() {
   const fullText = getStreamingAssistantText(streamingAssistantState);
   if (!fullText) return;
 
-  const display = splitStreamingAssistantText(fullText);
   streamingAssistantRuntime.rowEl.classList.remove("streaming-assistant-live");
-  syncStreamingAssistantBubble(streamingAssistantRuntime, display, { seal: true });
-  streamingAssistantRuntime.committedCount =
-    display.committedSegments.length + (display.liveText ? 1 : 0);
+  streamingAssistantRuntime.bubbleEl.classList.add("msg-bubble-md");
+  streamingAssistantRuntime.bubbleEl.innerHTML = wrapMarkdownContent(fullText);
+  streamingAssistantRuntime.segmentEls = [];
+  streamingAssistantRuntime.liveEl = null;
+  streamingAssistantRuntime.caretEl = null;
+  streamingAssistantRuntime.committedCount = 1;
 }
 
 function closeStreamingAssistantTurn() {
@@ -994,7 +892,7 @@ function createTraceHostRow(host, content = "") {
   row.dataset.traceHostId = host.id;
   row.innerHTML = `
     <div class="assistant-turn${host.kind === "orphan" ? " assistant-turn-orphan" : ""}">
-      ${content ? `<div class="msg-bubble">${formatAssistantContent(content)}</div>` : ""}
+      ${content ? `<div class="msg-bubble msg-bubble-md">${wrapMarkdownContent(content)}</div>` : ""}
       <div class="assistant-trace hidden">
         <button type="button" class="assistant-trace-toggle" aria-expanded="false">
           ${renderTraceToggleGlyph()}
@@ -1257,7 +1155,7 @@ export function renderExitPlanMode(payload) {
   } else {
     el.innerHTML = `
       <div class="plan-title">Ready to code?</div>
-      <div class="plan-content">${formatPlanContent(planContent)}</div>
+      <div class="plan-content markdown-content">${formatPlanContent(planContent)}</div>
       <div class="plan-options">
         <button class="plan-option" data-value="yes-accept-edits" onclick="window._selectPlanOption(this, 'yes-accept-edits')">
           <span class="plan-option-label">Yes, auto-accept edits</span>
