@@ -1,5 +1,11 @@
 import { Hono } from "hono";
-import { getSession, incrementEpoch, touchSession, updateSessionStatus } from "../../services/session";
+import {
+  getSession,
+  incrementEpoch,
+  touchSession,
+  updateSessionStatus,
+  validateWorkerEpoch,
+} from "../../services/session";
 import {
   automationStatesEqual,
   getAutomationStateEventPayload,
@@ -33,12 +39,12 @@ app.get("/:id/worker", acceptCliHeaders, sessionIngressAuth, async (c) => {
 /** PUT /v1/code/sessions/:id/worker — Update worker state */
 app.put("/:id/worker", acceptCliHeaders, sessionIngressAuth, async (c) => {
   const sessionId = c.req.param("id")!;
-  const session = getSession(sessionId);
-  if (!session) {
-    return c.json({ error: { type: "not_found", message: "Session not found" } }, 404);
-  }
-
   const body = await c.req.json();
+  const validation = validateWorkerEpoch(sessionId, body.worker_epoch);
+  if (!validation.ok) {
+    return c.json({ error: validation.error }, validation.status as 400 | 404 | 409);
+  }
+  const { session } = validation;
   const prevAutomationState = getAutomationStateEventPayload(
     storeGetSessionWorker(sessionId)?.externalMetadata,
   );
@@ -79,11 +85,11 @@ app.put("/:id/worker", acceptCliHeaders, sessionIngressAuth, async (c) => {
 /** POST /v1/code/sessions/:id/worker/heartbeat — Keep worker alive */
 app.post("/:id/worker/heartbeat", acceptCliHeaders, sessionIngressAuth, async (c) => {
   const sessionId = c.req.param("id")!;
-  const session = getSession(sessionId);
-  if (!session) {
-    return c.json({ error: { type: "not_found", message: "Session not found" } }, 404);
+  const body = await c.req.json();
+  const validation = validateWorkerEpoch(sessionId, body.worker_epoch);
+  if (!validation.ok) {
+    return c.json({ error: validation.error }, validation.status as 400 | 404 | 409);
   }
-
   const now = new Date();
   storeUpsertSessionWorker(sessionId, { lastHeartbeatAt: now });
   touchSession(sessionId);

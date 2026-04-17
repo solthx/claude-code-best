@@ -113,6 +113,7 @@ import {
 import { endInteractionSpan } from '../utils/telemetry/sessionTracing.js';
 import { useLogMessages } from '../hooks/useLogMessages.js';
 import { useReplBridge } from '../hooks/useReplBridge.js';
+import { getReplBridgeHandle } from '../bridge/replBridgeHandle.js';
 import {
   type Command,
   type CommandResultDisplay,
@@ -170,6 +171,7 @@ import { errorMessage, toError } from '../utils/errors.js';
 import { isHumanTurn } from '../utils/messagePredicates.js';
 import { logError } from '../utils/log.js';
 import { getCwd } from '../utils/cwd.js';
+import type { SDKMessage } from '../entrypoints/agentSdkTypes.js';
 // Dead code elimination: conditional imports
 /* eslint-disable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
 const useVoiceIntegration: typeof import('../hooks/useVoiceIntegration.js').useVoiceIntegration = feature('VOICE_MODE')
@@ -3047,6 +3049,10 @@ export function REPL({
 
   const onQueryEvent = useCallback(
     (event: Parameters<typeof handleMessageFromStream>[0]) => {
+      if (event.type === 'stream_event') {
+        getReplBridgeHandle()?.writeSdkMessages([event as SDKMessage]);
+      }
+
       handleMessageFromStream(
         event,
         newMessage => {

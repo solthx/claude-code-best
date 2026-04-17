@@ -55,6 +55,12 @@ export function normalizePayload(type: string, payload: unknown): Record<string,
   if (typeof p.isSynthetic === "boolean") normalized.isSynthetic = p.isSynthetic;
   if (typeof p.status === "string") normalized.status = p.status;
   if (typeof p.subtype === "string") normalized.subtype = p.subtype;
+  if (p.event) normalized.event = p.event;
+  if (typeof p.session_id === "string") normalized.session_id = p.session_id;
+  if (p.parent_tool_use_id === null || typeof p.parent_tool_use_id === "string") {
+    normalized.parent_tool_use_id = p.parent_tool_use_id;
+  }
+  if (typeof p.ttftMs === "number") normalized.ttftMs = p.ttftMs;
 
   // Preserve tool fields
   if (p.tool_name) normalized.tool_name = p.tool_name;
@@ -67,6 +73,7 @@ export function normalizePayload(type: string, payload: unknown): Record<string,
   if (p.request) normalized.request = p.request;
   if (p.approved !== undefined) normalized.approved = p.approved;
   if (p.updated_input) normalized.updated_input = p.updated_input;
+  if (Array.isArray(p.updated_permissions)) normalized.updated_permissions = p.updated_permissions;
 
   // Preserve message field for backward compat
   if (p.message) normalized.message = p.message;

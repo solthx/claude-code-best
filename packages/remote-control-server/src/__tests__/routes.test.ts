@@ -688,12 +688,18 @@ describe("Web Session Routes", () => {
       session: { id },
     } = await createRes.json();
     storeBindSession(id, "user-1");
+    const registerRes = await app.request(`/v1/code/sessions/${id}/worker/register`, {
+      method: "POST",
+      headers: AUTH_HEADERS,
+    });
+    expect(registerRes.status).toBe(200);
+    const { worker_epoch } = await registerRes.json();
 
     await app.request(`/v1/code/sessions/${id}/worker`, {
       method: "PUT",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
       body: JSON.stringify({
-        worker_epoch: 1,
+        worker_epoch,
         external_metadata: {
           automation_state: {
             enabled: true,
@@ -1225,6 +1231,16 @@ describe("V2 Worker Events Routes", () => {
     app = createApp();
   });
 
+  async function registerWorker(sessionId: string): Promise<number> {
+    const registerRes = await app.request(`/v1/code/sessions/${sessionId}/worker/register`, {
+      method: "POST",
+      headers: AUTH_HEADERS,
+    });
+    expect(registerRes.status).toBe(200);
+    const body = await registerRes.json();
+    return body.worker_epoch;
+  }
+
   test("POST /v1/code/sessions/:id/worker/events — publishes worker events", async () => {
     // Create session
     const sessRes = await app.request("/v1/sessions", {
@@ -1233,11 +1249,15 @@ describe("V2 Worker Events Routes", () => {
       body: JSON.stringify({}),
     });
     const { id } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
 
     const res = await app.request(`/v1/code/sessions/${id}/worker/events`, {
       method: "POST",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
-      body: JSON.stringify([{ type: "assistant", content: "response" }]),
+      body: JSON.stringify({
+        worker_epoch: workerEpoch,
+        events: [{ type: "assistant", content: "response" }],
+      }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -1252,12 +1272,13 @@ describe("V2 Worker Events Routes", () => {
       body: JSON.stringify({}),
     });
     const { session: { id } } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
 
     const res = await app.request(`/v1/code/sessions/${id}/worker/events`, {
       method: "POST",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
       body: JSON.stringify({
-        worker_epoch: 1,
+        worker_epoch: workerEpoch,
         events: [{ payload: { type: "assistant", content: "response" } }],
       }),
     });
@@ -1271,6 +1292,46 @@ describe("V2 Worker Events Routes", () => {
     expect((events[0]?.payload as { content?: string }).content).toBe("response");
   });
 
+  test("POST /v1/code/sessions/:id/worker/events — preserves stream_event payloads for web replay", async () => {
+    const sessRes = await app.request("/v1/code/sessions", {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { session: { id } } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
+
+    const res = await app.request(`/v1/code/sessions/${id}/worker/events`, {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        worker_epoch: workerEpoch,
+        events: [{
+          payload: {
+            type: "stream_event",
+            session_id: id,
+            parent_tool_use_id: null,
+            event: {
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: "Once upon a time" },
+            },
+          },
+        }],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const events = getEventBus(id).getEventsSince(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe("stream_event");
+    expect((events[0]?.payload as { event?: unknown }).event).toEqual({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "Once upon a time" },
+    });
+  });
+
   test("GET/PUT /v1/code/sessions/:id/worker — stores worker state", async () => {
     const sessRes = await app.request("/v1/code/sessions", {
       method: "POST",
@@ -1278,12 +1339,13 @@ describe("V2 Worker Events Routes", () => {
       body: JSON.stringify({}),
     });
     const { session: { id } } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
 
     const putRes = await app.request(`/v1/code/sessions/${id}/worker`, {
       method: "PUT",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
       body: JSON.stringify({
-        worker_epoch: 1,
+        worker_epoch: workerEpoch,
         worker_status: "running",
         external_metadata: {
           permission_mode: "default",
@@ -1329,11 +1391,12 @@ describe("V2 Worker Events Routes", () => {
       body: JSON.stringify({}),
     });
     const { session: { id } } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
 
     const heartbeatRes = await app.request(`/v1/code/sessions/${id}/worker/heartbeat`, {
       method: "POST",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
-      body: JSON.stringify({ worker_epoch: 1 }),
+      body: JSON.stringify({ worker_epoch: workerEpoch }),
     });
     expect(heartbeatRes.status).toBe(200);
 
@@ -1342,6 +1405,23 @@ describe("V2 Worker Events Routes", () => {
     });
     const body = await getRes.json();
     expect(body.worker.last_heartbeat_at).toBeTruthy();
+  });
+
+  test("POST /v1/code/sessions/:id/worker/heartbeat — rejects stale worker_epoch", async () => {
+    const sessRes = await app.request("/v1/code/sessions", {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { session: { id } } = await sessRes.json();
+    await registerWorker(id);
+
+    const heartbeatRes = await app.request(`/v1/code/sessions/${id}/worker/heartbeat`, {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ worker_epoch: 999 }),
+    });
+    expect(heartbeatRes.status).toBe(409);
   });
 
   test("GET /v1/code/sessions/:id/worker/events/stream — emits CCR client_event frames", async () => {
@@ -1411,6 +1491,45 @@ describe("V2 Worker Events Routes", () => {
     expect(frame).toContain("\"payload\":{\"type\":\"control_response\"");
     expect(frame).toContain("\"request_id\":\"req-1\"");
     expect(frame).toContain("\"behavior\":\"allow\"");
+    reader.cancel();
+  });
+
+  test("GET /v1/code/sessions/:id/worker/events/stream — preserves updated_permissions from web plan approvals", async () => {
+    const createRes = await app.request("/web/sessions?uuid=user-1", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { id } = await createRes.json();
+
+    const streamRes = await app.request(`/v1/code/sessions/${id}/worker/events/stream`, {
+      headers: AUTH_HEADERS,
+    });
+    expect(streamRes.status).toBe(200);
+
+    const reader = streamRes.body?.getReader();
+    expect(reader).toBeTruthy();
+    if (!reader) return;
+
+    await reader.read();
+
+    const controlRes = await app.request(`/web/sessions/${id}/control?uuid=user-1`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "permission_response",
+        approved: true,
+        request_id: "req-plan-1",
+        updated_input: { plan: "my plan" },
+        updated_permissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+      }),
+    });
+    expect(controlRes.status).toBe(200);
+
+    const chunk = await reader.read();
+    const frame = new TextDecoder().decode(chunk.value!);
+    expect(frame).toContain("\"updatedInput\":{\"plan\":\"my plan\"}");
+    expect(frame).toContain("\"updatedPermissions\":[{\"type\":\"setMode\",\"mode\":\"acceptEdits\",\"destination\":\"session\"}]");
     reader.cancel();
   });
 
@@ -1498,13 +1617,51 @@ describe("V2 Worker Events Routes", () => {
       body: JSON.stringify({}),
     });
     const { id } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
 
     const res = await app.request(`/v1/code/sessions/${id}/worker/state`, {
       method: "PUT",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "running" }),
+      body: JSON.stringify({ worker_epoch: workerEpoch, status: "running" }),
     });
     expect(res.status).toBe(200);
+  });
+
+  test("POST /v1/code/sessions/:id/worker/events — rejects stale worker_epoch", async () => {
+    const sessRes = await app.request("/v1/code/sessions", {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { session: { id } } = await sessRes.json();
+    await registerWorker(id);
+
+    const res = await app.request(`/v1/code/sessions/${id}/worker/events`, {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        worker_epoch: 999,
+        events: [{ type: "assistant", content: "response" }],
+      }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  test("PUT /v1/code/sessions/:id/worker/state — rejects stale worker_epoch", async () => {
+    const sessRes = await app.request("/v1/sessions", {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { id } = await sessRes.json();
+    await registerWorker(id);
+
+    const res = await app.request(`/v1/code/sessions/${id}/worker/state`, {
+      method: "PUT",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ worker_epoch: 999, status: "running" }),
+    });
+    expect(res.status).toBe(409);
   });
 
   test("PUT /v1/code/sessions/:id/worker/external_metadata — no-op", async () => {
@@ -1514,13 +1671,31 @@ describe("V2 Worker Events Routes", () => {
       body: JSON.stringify({}),
     });
     const { id } = await sessRes.json();
+    const workerEpoch = await registerWorker(id);
 
     const res = await app.request(`/v1/code/sessions/${id}/worker/external_metadata`, {
       method: "PUT",
       headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
-      body: JSON.stringify({ meta: "data" }),
+      body: JSON.stringify({ worker_epoch: workerEpoch, meta: "data" }),
     });
     expect(res.status).toBe(200);
+  });
+
+  test("PUT /v1/code/sessions/:id/worker — rejects stale worker_epoch", async () => {
+    const sessRes = await app.request("/v1/code/sessions", {
+      method: "POST",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { session: { id } } = await sessRes.json();
+    await registerWorker(id);
+
+    const res = await app.request(`/v1/code/sessions/${id}/worker`, {
+      method: "PUT",
+      headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ worker_epoch: 999, worker_status: "running" }),
+    });
+    expect(res.status).toBe(409);
   });
 
   test("POST /v1/code/sessions/:id/worker/events/:eventId/delivery — no-op", async () => {

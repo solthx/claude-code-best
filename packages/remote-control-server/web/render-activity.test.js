@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   formatCountdownRemaining,
   resolveActivityMode,
+  shouldShowPendingResponseActivity,
   shouldRenderTranscriptActivity,
 } from "./render.js";
 
@@ -21,10 +22,17 @@ describe("render activity helpers", () => {
     expect(formatCountdownRemaining(null, 0)).toBe("");
   });
 
-  test("renders transcript activity only for active work", () => {
-    expect(shouldRenderTranscriptActivity("working")).toBe(true);
+  test("does not render transcript activity rows for working state", () => {
+    expect(shouldRenderTranscriptActivity("working")).toBe(false);
     expect(shouldRenderTranscriptActivity("standby")).toBe(false);
     expect(shouldRenderTranscriptActivity("sleeping")).toBe(false);
     expect(shouldRenderTranscriptActivity("idle")).toBe(false);
+  });
+
+  test("shows pending response activity only while waiting for first assistant text", () => {
+    expect(shouldShowPendingResponseActivity("working", true)).toBe(true);
+    expect(shouldShowPendingResponseActivity("working", false)).toBe(false);
+    expect(shouldShowPendingResponseActivity("standby", true)).toBe(false);
+    expect(shouldShowPendingResponseActivity("idle", true)).toBe(false);
   });
 });

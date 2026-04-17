@@ -17,6 +17,7 @@ import { initTaskPanel, toggleTaskPanel, resetTaskState } from "./task-panel.js"
 import {
   createAutomationState,
   getAutomationActivity,
+  getAutomationDisplayStatus,
   getAutomationIndicator,
   reduceAutomationState,
   renderAutomationIcon,
@@ -35,6 +36,14 @@ let cachedEnvs = [];
 let automationState = createAutomationState();
 let automationPulseTimer = null;
 
+function getDisplaySessionStatus() {
+  return getAutomationDisplayStatus(automationState, currentSessionStatus);
+}
+
+function isAutomationBusy() {
+  return getDisplaySessionStatus() === "running";
+}
+
 function generateMessageUuid() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -46,7 +55,7 @@ function renderAutomationIndicator() {
   const indicatorEl = document.getElementById("session-automation");
   if (!indicatorEl) return;
 
-  const indicator = getAutomationIndicator(automationState);
+  const indicator = getAutomationIndicator(automationState, { isBusy: isAutomationBusy() });
   if (!indicator.visible) {
     indicatorEl.className = "automation-pill hidden";
     indicatorEl.dataset.pulsing = "false";
@@ -67,8 +76,18 @@ function renderAutomationIndicator() {
 }
 
 function syncAutomationUI() {
+  renderSessionStatusBadge();
   renderAutomationIndicator();
-  setAutomationActivity(getAutomationActivity(automationState));
+  setAutomationActivity(getAutomationActivity(automationState, { isBusy: isAutomationBusy() }));
+}
+
+function renderSessionStatusBadge() {
+  const badge = document.getElementById("session-status");
+  if (!badge) return;
+
+  const displayStatus = getDisplaySessionStatus();
+  badge.textContent = displayStatus || "";
+  badge.className = `status-badge status-${statusClass(displayStatus)}`;
 }
 
 function stopAutomationPulse() {
@@ -84,7 +103,7 @@ function stopAutomationPulse() {
 }
 
 function pulseAutomationIndicator() {
-  if (!getAutomationIndicator(automationState).visible) return;
+  if (!getAutomationIndicator(automationState, { isBusy: isAutomationBusy() }).visible) return;
 
   stopAutomationPulse();
   const indicatorEl = document.getElementById("session-automation");
@@ -148,12 +167,6 @@ window.navigate = navigate;
 function applySessionStatus(status) {
   currentSessionStatus = status || null;
 
-  const badge = document.getElementById("session-status");
-  if (badge) {
-    badge.textContent = status || "";
-    badge.className = `status-badge status-${statusClass(status)}`;
-  }
-
   const closed = isClosedSessionStatus(status);
   const input = document.getElementById("msg-input");
   if (input) {
@@ -167,10 +180,14 @@ function applySessionStatus(status) {
     actionBtn.title = closed ? "Session is closed" : "";
   }
 
+  renderSessionStatusBadge();
+
   if (closed) {
     removeLoading();
     window.__updateActionBtn?.("idle");
   }
+
+  syncAutomationUI();
 }
 
 function handleSessionEvent(event) {

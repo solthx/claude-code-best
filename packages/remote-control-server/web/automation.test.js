@@ -5,6 +5,7 @@ import {
   PROACTIVE_ENABLED_TEXT,
   createAutomationState,
   getAutomationActivity,
+  getAutomationDisplayStatus,
   getAutomationIndicator,
   isAutomationEnvelopeText,
   reduceAutomationState,
@@ -152,7 +153,7 @@ describe("automation helpers", () => {
     });
     expect(getAutomationIndicator(state)).toEqual({
       visible: true,
-      label: "Autopilot",
+      label: "Standby",
       tone: "proactive",
       title: "Claude Code is in proactive mode and waiting for the next scheduled check-in.",
       iconVariant: "standby",
@@ -173,6 +174,7 @@ describe("automation helpers", () => {
         sleep_until: 999999,
       },
     });
+    expect(getAutomationIndicator(state).label).toBe("Sleeping");
     expect(getAutomationIndicator(state).tone).toBe("sleeping");
     expect(getAutomationIndicator(state).iconVariant).toBe("sleeping");
     expect(getAutomationActivity(state)).toEqual({
@@ -181,6 +183,56 @@ describe("automation helpers", () => {
       endsAt: 999999,
       iconVariant: "sleeping",
     });
+  });
+
+  test("authoritative standby and sleeping states present as idle session status", () => {
+    let state = createAutomationState();
+
+    state = reduceAutomationState(state, {
+      type: "automation_state",
+      payload: {
+        enabled: true,
+        phase: "standby",
+        next_tick_at: 123456,
+        sleep_until: null,
+      },
+    });
+    expect(getAutomationDisplayStatus(state, "running")).toBe("idle");
+
+    state = reduceAutomationState(state, {
+      type: "automation_state",
+      payload: {
+        enabled: true,
+        phase: "sleeping",
+        next_tick_at: null,
+        sleep_until: 999999,
+      },
+    });
+    expect(getAutomationDisplayStatus(state, "running")).toBe("idle");
+    expect(getAutomationDisplayStatus(createAutomationState(), "running")).toBe("running");
+  });
+
+  test("busy proactive sessions use active autopilot copy instead of standby copy", () => {
+    let state = createAutomationState();
+
+    state = reduceAutomationState(state, {
+      type: "automation_state",
+      payload: {
+        enabled: true,
+        phase: "standby",
+        next_tick_at: 123456,
+        sleep_until: null,
+      },
+    });
+
+    expect(getAutomationIndicator(state, { isBusy: true })).toEqual({
+      visible: true,
+      label: "Autopilot",
+      tone: "proactive",
+      title: "Claude Code is in proactive mode and may continue working between user messages.",
+      iconVariant: "active",
+    });
+    expect(getAutomationActivity(state, { isBusy: true })).toBeNull();
   });
 
   test("authoritative disabled snapshot suppresses heuristic auto-run fallback", () => {

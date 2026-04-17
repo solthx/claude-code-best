@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import { sessionIngressAuth, acceptCliHeaders } from "../../auth/middleware";
 import { publishSessionEvent } from "../../services/transport";
-import { getSession, touchSession, updateSessionStatus } from "../../services/session";
+import {
+  getSession,
+  touchSession,
+  updateSessionStatus,
+  validateWorkerEpoch,
+} from "../../services/session";
 
 const app = new Hono();
 
@@ -31,10 +36,14 @@ function extractWorkerEvents(body: unknown): Array<Record<string, unknown>> {
 /** POST /v1/code/sessions/:id/worker/events — Write events */
 app.post("/:id/worker/events", acceptCliHeaders, sessionIngressAuth, async (c) => {
   const sessionId = c.req.param("id")!;
-  if (!getSession(sessionId)) {
-    return c.json({ error: { type: "not_found", message: "Session not found" } }, 404);
-  }
   const body = await c.req.json();
+  const rawWorkerEpoch = !Array.isArray(body) && body && typeof body === "object"
+    ? (body as Record<string, unknown>).worker_epoch
+    : undefined;
+  const validation = validateWorkerEpoch(sessionId, rawWorkerEpoch);
+  if (!validation.ok) {
+    return c.json({ error: validation.error }, validation.status as 400 | 404 | 409);
+  }
 
   const events = extractWorkerEvents(body);
   const published = [];
@@ -52,10 +61,11 @@ app.post("/:id/worker/events", acceptCliHeaders, sessionIngressAuth, async (c) =
 /** PUT /v1/code/sessions/:id/worker/state — Report worker state */
 app.put("/:id/worker/state", acceptCliHeaders, sessionIngressAuth, async (c) => {
   const sessionId = c.req.param("id")!;
-  if (!getSession(sessionId)) {
-    return c.json({ error: { type: "not_found", message: "Session not found" } }, 404);
-  }
   const body = await c.req.json();
+  const validation = validateWorkerEpoch(sessionId, body.worker_epoch);
+  if (!validation.ok) {
+    return c.json({ error: validation.error }, validation.status as 400 | 404 | 409);
+  }
 
   if (body.status) {
     updateSessionStatus(sessionId, body.status);
@@ -69,8 +79,10 @@ app.put("/:id/worker/state", acceptCliHeaders, sessionIngressAuth, async (c) => 
 /** PUT /v1/code/sessions/:id/worker/external_metadata — Report worker metadata (no-op) */
 app.put("/:id/worker/external_metadata", acceptCliHeaders, sessionIngressAuth, async (c) => {
   const sessionId = c.req.param("id")!;
-  if (!getSession(sessionId)) {
-    return c.json({ error: { type: "not_found", message: "Session not found" } }, 404);
+  const body = await c.req.json();
+  const validation = validateWorkerEpoch(sessionId, body.worker_epoch);
+  if (!validation.ok) {
+    return c.json({ error: validation.error }, validation.status as 400 | 404 | 409);
   }
   // TUI's CCRClient calls this for metadata reporting. Accept and discard.
   return c.json({ status: "ok" }, 200);

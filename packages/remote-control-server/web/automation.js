@@ -260,7 +260,9 @@ export function shouldPulseAutomationIndicator(event) {
   return event.type === "user" && shouldHideAutomationUserEvent(event.payload || {}, event.direction || "inbound");
 }
 
-export function getAutomationIndicator(state) {
+export function getAutomationIndicator(state, options = {}) {
+  const isBusy = options.isBusy === true;
+
   if (state?.hasAuthority) {
     if (!state.enabled) {
       return {
@@ -272,10 +274,20 @@ export function getAutomationIndicator(state) {
       };
     }
 
-    if (state.phase === "sleeping") {
+    if (isBusy) {
       return {
         visible: true,
         label: "Autopilot",
+        tone: "proactive",
+        title: "Claude Code is in proactive mode and may continue working between user messages.",
+        iconVariant: "active",
+      };
+    }
+
+    if (state.phase === "sleeping") {
+      return {
+        visible: true,
+        label: "Sleeping",
         tone: "sleeping",
         title: "Claude Code is in proactive mode and currently sleeping until the next wake-up or user message.",
         iconVariant: "sleeping",
@@ -285,7 +297,7 @@ export function getAutomationIndicator(state) {
     if (state.phase === "standby") {
       return {
         visible: true,
-        label: "Autopilot",
+        label: "Standby",
         tone: "proactive",
         title: "Claude Code is in proactive mode and waiting for the next scheduled check-in.",
         iconVariant: "standby",
@@ -330,7 +342,23 @@ export function getAutomationIndicator(state) {
   };
 }
 
-export function getAutomationActivity(state) {
+export function getAutomationDisplayStatus(state, currentStatus) {
+  if (state?.hasAuthority && state.enabled) {
+    if (state.phase === "standby" || state.phase === "sleeping") {
+      return "idle";
+    }
+  }
+
+  return currentStatus || "";
+}
+
+export function getAutomationActivity(state, options = {}) {
+  const isBusy = options.isBusy === true;
+
+  if (isBusy) {
+    return null;
+  }
+
   if (!state?.hasAuthority || !state.enabled) {
     return null;
   }

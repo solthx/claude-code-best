@@ -75,6 +75,49 @@ export function getSession(sessionId: string): SessionResponse | null {
   return record ? toResponse(record) : null;
 }
 
+export function validateWorkerEpoch(
+  sessionId: string,
+  workerEpoch: unknown,
+): {
+  ok: true;
+  session: SessionResponse;
+} | {
+  ok: false;
+  status: number;
+  error: { type: string; message: string };
+} {
+  const session = getSession(sessionId);
+  if (!session) {
+    return {
+      ok: false,
+      status: 404,
+      error: { type: "not_found", message: "Session not found" },
+    };
+  }
+
+  if (typeof workerEpoch !== "number" || !Number.isInteger(workerEpoch) || workerEpoch < 1) {
+    return {
+      ok: false,
+      status: 400,
+      error: { type: "invalid_request", message: "worker_epoch must be a positive integer" },
+    };
+  }
+
+  const currentWorkerEpoch = session.worker_epoch;
+  if (workerEpoch !== currentWorkerEpoch) {
+    return {
+      ok: false,
+      status: 409,
+      error: {
+        type: "stale_worker_epoch",
+        message: `worker_epoch ${workerEpoch} does not match current session epoch ${currentWorkerEpoch}`,
+      },
+    };
+  }
+
+  return { ok: true, session };
+}
+
 export function isSessionClosedStatus(status: string | null | undefined): boolean {
   return !!status && CLOSED_SESSION_STATUSES.has(status);
 }

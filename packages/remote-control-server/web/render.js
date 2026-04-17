@@ -21,6 +21,8 @@ const replayPendingRequests = new Map();   // request_id → event data (unresol
 const replayRespondedRequests = new Set(); // request_ids that have a response
 const renderedUserUuids = new Set();
 const traceHostElements = new Map(); // host_id → DOM refs for inline tool traces
+const STREAM_SENTENCE_ENDINGS = new Set(["。", "！", "？", "!", "?"]);
+const STREAM_CLOSING_PUNCTUATION = new Set(['"', "'", "”", "’", "）", ")", "]", "】"]);
 
 export function createToolTraceState() {
   return {
@@ -83,9 +85,139 @@ export function addToolTraceEntry(state, entryKind) {
 
 let toolTraceState = createToolTraceState();
 
+export function createStreamingAssistantTextState() {
+  return {
+    messageId: null,
+    blockKinds: {},
+    blockTexts: {},
+  };
+}
+
+function createStreamingAssistantRuntime() {
+  return {
+    rowEl: null,
+    bubbleEl: null,
+    committedCount: 0,
+    segmentEls: [],
+    liveEl: null,
+    caretEl: null,
+  };
+}
+
+function cloneStreamingAssistantTextState(state) {
+  return {
+    messageId: state.messageId,
+    blockKinds: { ...state.blockKinds },
+    blockTexts: { ...state.blockTexts },
+  };
+}
+
+function getStreamingAssistantEvent(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const event = payload.event;
+  return event && typeof event === "object" ? event : null;
+}
+
+export function applyStreamingAssistantEvent(state, payload) {
+  const event = getStreamingAssistantEvent(payload);
+  if (!event) return state;
+
+  if (event.type === "message_start") {
+    return {
+      messageId: typeof event.message?.id === "string" ? event.message.id : null,
+      blockKinds: {},
+      blockTexts: {},
+    };
+  }
+
+  if (event.type === "content_block_start") {
+    if (typeof event.index !== "number") return state;
+    const kind = typeof event.content_block?.type === "string" ? event.content_block.type : null;
+    if (!kind) return state;
+
+    const nextState = cloneStreamingAssistantTextState(state);
+    nextState.blockKinds[event.index] = kind;
+    return nextState;
+  }
+
+  if (event.type === "content_block_delta") {
+    if (typeof event.index !== "number") return state;
+    if (event.delta?.type !== "text_delta" || typeof event.delta.text !== "string") return state;
+
+    const nextState = cloneStreamingAssistantTextState(state);
+    nextState.blockKinds[event.index] = nextState.blockKinds[event.index] || "text";
+    nextState.blockTexts[event.index] = (nextState.blockTexts[event.index] || "") + event.delta.text;
+    return nextState;
+  }
+
+  return state;
+}
+
+export function getStreamingAssistantText(state) {
+  return Object.keys(state.blockTexts)
+    .map((index) => Number(index))
+    .sort((a, b) => a - b)
+    .filter((index) => state.blockKinds[index] === "text")
+    .map((index) => state.blockTexts[index] || "")
+    .join("");
+}
+
+export function splitStreamingAssistantText(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return { committedSegments: [], liveText: "" };
+  }
+
+  const committedSegments = [];
+  let segmentStart = 0;
+  let index = 0;
+
+  while (index < text.length) {
+    if (text[index] === "\n" && text[index + 1] === "\n") {
+      let end = index + 2;
+      while (end < text.length && text[end] === "\n") end += 1;
+      committedSegments.push(text.slice(segmentStart, end));
+      segmentStart = end;
+      index = end;
+      continue;
+    }
+
+    if (STREAM_SENTENCE_ENDINGS.has(text[index])) {
+      let end = index + 1;
+      while (end < text.length && STREAM_CLOSING_PUNCTUATION.has(text[end])) {
+        end += 1;
+      }
+      while (end < text.length && text[end] === " ") {
+        end += 1;
+      }
+      committedSegments.push(text.slice(segmentStart, end));
+      segmentStart = end;
+      index = end;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return {
+    committedSegments: committedSegments.filter((segment) => segment.length > 0),
+    liveText: text.slice(segmentStart),
+  };
+}
+
+let streamingAssistantState = createStreamingAssistantTextState();
+let streamingAssistantRuntime = createStreamingAssistantRuntime();
+
 function resetToolTraceRuntime() {
   toolTraceState = createToolTraceState();
   traceHostElements.clear();
+}
+
+function resetStreamingAssistantRuntime({ removeRow = false } = {}) {
+  if (removeRow) {
+    streamingAssistantRuntime.rowEl?.remove();
+  }
+  streamingAssistantState = createStreamingAssistantTextState();
+  streamingAssistantRuntime = createStreamingAssistantRuntime();
 }
 
 /** Clear replay tracking state (call before each history load) */
@@ -94,6 +226,7 @@ export function resetReplayState() {
   replayRespondedRequests.clear();
   renderedUserUuids.clear();
   resetToolTraceRuntime();
+  resetStreamingAssistantRuntime();
 }
 
 export function isConversationClearedStatus(payload) {
@@ -153,6 +286,16 @@ function truncate(str, max) {
   if (!str) return "";
   const s = String(str);
   return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+function insertTranscriptElement(stream, el) {
+  const activityEl = document.getElementById(ACTIVITY_ID);
+  if (activityEl && activityEl.parentElement === stream) {
+    stream.insertBefore(el, activityEl);
+  } else {
+    stream.appendChild(el);
+  }
+  stream.scrollTop = stream.scrollHeight;
 }
 
 /**
@@ -311,6 +454,191 @@ function getEmbeddedToolBlocks(payload, blockType) {
   return getMessageContentBlocks(payload).filter((block) => block.type === blockType);
 }
 
+function ensureStreamingAssistantRow(stream) {
+  if (streamingAssistantRuntime.rowEl && streamingAssistantRuntime.bubbleEl) {
+    return streamingAssistantRuntime;
+  }
+
+  const row = document.createElement("div");
+  row.className = "msg-row assistant streaming-assistant";
+  row.innerHTML = `<div class="msg-bubble streaming-assistant-bubble"></div>`;
+
+  streamingAssistantRuntime.rowEl = row;
+  streamingAssistantRuntime.bubbleEl = row.querySelector(".msg-bubble");
+  streamingAssistantRuntime.committedCount = 0;
+  streamingAssistantRuntime.segmentEls = [];
+  streamingAssistantRuntime.liveEl = null;
+  streamingAssistantRuntime.caretEl = null;
+
+  insertTranscriptElement(stream, row);
+  return streamingAssistantRuntime;
+}
+
+function createStreamingSegmentElement(text) {
+  const el = document.createElement("span");
+  el.className = "stream-segment";
+  el.textContent = text;
+  return el;
+}
+
+function ensureStreamingCaret(runtime) {
+  if (!runtime.bubbleEl) return null;
+  if (runtime.caretEl && runtime.caretEl.parentElement === runtime.bubbleEl) {
+    return runtime.caretEl;
+  }
+
+  const caretEl = document.createElement("span");
+  caretEl.className = "stream-caret";
+  caretEl.setAttribute("aria-hidden", "true");
+  runtime.caretEl = caretEl;
+  runtime.bubbleEl.appendChild(caretEl);
+  return caretEl;
+}
+
+function removeStreamingCaret(runtime) {
+  if (!runtime.caretEl) return;
+  runtime.caretEl.remove();
+  runtime.caretEl = null;
+}
+
+function rebuildStreamingAssistantBubble(runtime, display, { seal = false } = {}) {
+  if (!runtime.bubbleEl) return;
+
+  runtime.bubbleEl.innerHTML = "";
+  runtime.segmentEls = [];
+  runtime.liveEl = null;
+  runtime.caretEl = null;
+
+  const targetSegments = [...display.committedSegments];
+  let liveText = display.liveText;
+
+  if (seal && liveText) {
+    targetSegments.push(liveText);
+    liveText = "";
+  }
+
+  for (const segment of targetSegments) {
+    const segmentEl = createStreamingSegmentElement(segment);
+    runtime.bubbleEl.appendChild(segmentEl);
+    runtime.segmentEls.push(segmentEl);
+  }
+
+  if (liveText) {
+    const liveEl = document.createElement("span");
+    liveEl.className = "stream-live";
+    liveEl.textContent = liveText;
+    runtime.bubbleEl.appendChild(liveEl);
+    runtime.liveEl = liveEl;
+    ensureStreamingCaret(runtime);
+  }
+}
+
+function syncStreamingAssistantBubble(runtime, display, { seal = false } = {}) {
+  if (!runtime.bubbleEl) return;
+
+  const targetSegments = [...display.committedSegments];
+  let liveText = display.liveText;
+
+  if (seal && liveText) {
+    targetSegments.push(liveText);
+    liveText = "";
+  }
+
+  const existingSegments = runtime.segmentEls.map((el) => el.textContent || "");
+  const isPrefixMatch =
+    existingSegments.length <= targetSegments.length &&
+    existingSegments.every((text, index) => text === targetSegments[index]);
+
+  if (!isPrefixMatch) {
+    rebuildStreamingAssistantBubble(runtime, display, { seal });
+    return;
+  }
+
+  for (let index = existingSegments.length; index < targetSegments.length; index += 1) {
+    const segmentEl = createStreamingSegmentElement(targetSegments[index]);
+    if (runtime.liveEl && runtime.liveEl.parentElement === runtime.bubbleEl) {
+      runtime.bubbleEl.insertBefore(segmentEl, runtime.liveEl);
+    } else if (runtime.caretEl && runtime.caretEl.parentElement === runtime.bubbleEl) {
+      runtime.bubbleEl.insertBefore(segmentEl, runtime.caretEl);
+    } else {
+      runtime.bubbleEl.appendChild(segmentEl);
+    }
+    runtime.segmentEls.push(segmentEl);
+  }
+
+  if (liveText) {
+    if (!runtime.liveEl || runtime.liveEl.parentElement !== runtime.bubbleEl) {
+      runtime.liveEl = document.createElement("span");
+      runtime.liveEl.className = "stream-live";
+      if (runtime.caretEl && runtime.caretEl.parentElement === runtime.bubbleEl) {
+        runtime.bubbleEl.insertBefore(runtime.liveEl, runtime.caretEl);
+      } else {
+        runtime.bubbleEl.appendChild(runtime.liveEl);
+      }
+    }
+    runtime.liveEl.textContent = liveText;
+    ensureStreamingCaret(runtime);
+  } else if (runtime.liveEl) {
+    runtime.liveEl.remove();
+    runtime.liveEl = null;
+    removeStreamingCaret(runtime);
+  }
+}
+
+function sealStreamingAssistantRow() {
+  if (!streamingAssistantRuntime.rowEl || !streamingAssistantRuntime.bubbleEl) return;
+
+  const fullText = getStreamingAssistantText(streamingAssistantState);
+  if (!fullText) return;
+
+  const display = splitStreamingAssistantText(fullText);
+  streamingAssistantRuntime.rowEl.classList.remove("streaming-assistant-live");
+  syncStreamingAssistantBubble(streamingAssistantRuntime, display, { seal: true });
+  streamingAssistantRuntime.committedCount =
+    display.committedSegments.length + (display.liveText ? 1 : 0);
+}
+
+function closeStreamingAssistantTurn() {
+  sealStreamingAssistantRow();
+  streamingAssistantState = createStreamingAssistantTextState();
+  streamingAssistantRuntime = createStreamingAssistantRuntime();
+}
+
+function updateStreamingAssistantRow(stream) {
+  const fullText = getStreamingAssistantText(streamingAssistantState);
+  if (!fullText.trim()) return false;
+
+  hidePendingResponseActivity();
+
+  const display = splitStreamingAssistantText(fullText);
+  const runtime = ensureStreamingAssistantRow(stream);
+  if (!runtime.bubbleEl || !runtime.rowEl) return false;
+
+  runtime.rowEl.classList.toggle("streaming-assistant-live", !!display.liveText);
+  syncStreamingAssistantBubble(runtime, display);
+  runtime.committedCount = display.committedSegments.length;
+  stream.scrollTop = stream.scrollHeight;
+  return true;
+}
+
+function handleStreamingAssistantEvent(stream, payload) {
+  const event = getStreamingAssistantEvent(payload);
+  if (!event) return false;
+
+  if (event.type === "message_start" && streamingAssistantRuntime.rowEl) {
+    closeStreamingAssistantTurn();
+  }
+
+  streamingAssistantState = applyStreamingAssistantEvent(streamingAssistantState, payload);
+
+  if (event.type === "message_stop") {
+    sealStreamingAssistantRow();
+    return true;
+  }
+
+  return updateStreamingAssistantRow(stream);
+}
+
 // ============================================================
 // Event Router
 // ============================================================
@@ -353,16 +681,29 @@ export function appendEvent(data, { replay = false } = {}) {
             if (shouldHideAutomationUserEvent(payload, direction)) {
               break;
             }
+            closeStreamingAssistantTurn();
             toolTraceState = clearActiveToolTraceHost(toolTraceState);
             histEls.push(renderUserMessage(payload, direction));
           }
         }
         break;
+      case "stream_event":
+        handleStreamingAssistantEvent(stream, payload);
+        return;
       case "assistant":
         {
           const text = extractText(payload);
           const toolUseBlocks = getEmbeddedToolBlocks(payload, "tool_use");
-          if (text && text.trim()) histEls.push(renderAssistantMessage(payload));
+          if (text && text.trim()) {
+            hidePendingResponseActivity();
+            const row = renderAssistantMessage(payload);
+            if (streamingAssistantRuntime.rowEl?.isConnected) {
+              streamingAssistantRuntime.rowEl.replaceWith(row);
+              resetStreamingAssistantRuntime();
+            } else {
+              histEls.push(row);
+            }
+          }
           for (const block of toolUseBlocks) {
             appendToolEntryToActiveTrace(
               "use",
@@ -455,6 +796,7 @@ export function appendEvent(data, { replay = false } = {}) {
         }
         if (!shouldProcessUserEvent(payload, direction)) return;
         if (!shouldHideAutomationUserEvent(payload, direction)) {
+          closeStreamingAssistantTurn();
           toolTraceState = clearActiveToolTraceHost(toolTraceState);
           els.push(renderUserMessage(payload, direction));
           needLoading = true;
@@ -463,6 +805,9 @@ export function appendEvent(data, { replay = false } = {}) {
         }
       }
       break;
+    case "stream_event":
+      handleStreamingAssistantEvent(stream, payload);
+      return;
     case "partial_assistant":
       // Skip partial assistant — wait for the final "assistant" event
       // to avoid blank/duplicate messages during streaming
@@ -472,8 +817,15 @@ export function appendEvent(data, { replay = false } = {}) {
         const text = extractText(payload);
         const toolUseBlocks = getEmbeddedToolBlocks(payload, "tool_use");
         if (text && text.trim()) {
+          hidePendingResponseActivity();
           removeLoading();
-          els.push(renderAssistantMessage(payload));
+          const row = renderAssistantMessage(payload);
+          if (streamingAssistantRuntime.rowEl?.isConnected) {
+            streamingAssistantRuntime.rowEl.replaceWith(row);
+            resetStreamingAssistantRuntime();
+          } else {
+            els.push(row);
+          }
         }
         for (const block of toolUseBlocks) {
           appendToolEntryToActiveTrace(
@@ -495,6 +847,7 @@ export function appendEvent(data, { replay = false } = {}) {
       return;
     case "result":
     case "result_success":
+      closeStreamingAssistantTurn();
       removeLoading();
       // Skip result — it just repeats the assistant message content
       return;
@@ -552,16 +905,19 @@ export function appendEvent(data, { replay = false } = {}) {
       }
       break;
     case "error":
+      closeStreamingAssistantTurn();
       removeLoading();
       els.push(renderSystemMessage(`Error: ${payload.message || payload.content || "Unknown error"}`));
       break;
     case "session_status":
       if (payload.status === "archived" || payload.status === "inactive") {
+        closeStreamingAssistantTurn();
         removeLoading();
         els.push(renderSystemMessage(`Session ${payload.status}`));
       }
       break;
     case "interrupt":
+      closeStreamingAssistantTurn();
       removeLoading();
       els.push(renderSystemMessage("Session interrupted"));
       break;
@@ -577,8 +933,7 @@ export function appendEvent(data, { replay = false } = {}) {
   }
 
   for (const el of els) {
-    stream.appendChild(el);
-    stream.scrollTop = stream.scrollHeight;
+    insertTranscriptElement(stream, el);
   }
 
   // Show loading after the message element is in the DOM so it renders below
@@ -617,8 +972,15 @@ function bindTraceToggle(toggleEl, panelEl, traceEl) {
   });
 }
 
+export function getTraceHostVisibleEntryCount(refs) {
+  const childCount = refs?.panelEl?.childElementCount;
+  if (typeof childCount === "number") return childCount;
+  return typeof refs?.entryCount === "number" ? refs.entryCount : 0;
+}
+
 function updateTraceHostDisplay(refs) {
   if (!refs) return;
+  refs.entryCount = getTraceHostVisibleEntryCount(refs);
   refs.traceEl.classList.toggle("hidden", refs.entryCount === 0);
   refs.countEl.textContent = String(refs.entryCount);
   refs.toggleEl.classList.toggle("has-error", refs.hasError);
@@ -657,7 +1019,7 @@ function createTraceHostRow(host, content = "") {
     panelEl,
     toggleEl,
     countEl,
-    entryCount: host.entryKinds.length,
+    entryCount: 0,
     hasError: false,
   };
 
@@ -744,7 +1106,6 @@ function appendToolEntryToActiveTrace(entryKind, payload, rows) {
 
   const card = entryKind === "use" ? renderToolUse(payload) : renderToolResult(payload);
   refs.panelEl.appendChild(card);
-  refs.entryCount += 1;
   if (entryKind === "result" && payload.is_error) {
     refs.hasError = true;
   }
@@ -938,14 +1299,10 @@ function renderSystemMessage(text) {
 }
 
 // ============================================================
-// Loading Indicator — TUI star spinner style
+// Session Activity Indicator
 // ============================================================
 
-const ACTIVITY_ID = "session-activity-indicator";
-
-// TUI star spinner frames (same as Claude Code CLI)
-const SPINNER_FRAMES = ["·", "✢", "✱", "✶", "✻", "✽"];
-const SPINNER_CYCLE = [...SPINNER_FRAMES, ...SPINNER_FRAMES.slice().reverse()];
+const ACTIVITY_ID = "session-activity";
 
 // 204 verbs from TUI src/constants/spinnerVerbs.ts
 const SPINNER_VERBS = [
@@ -983,17 +1340,11 @@ const SPINNER_VERBS = [
   "Whirring","Whisking","Wibbling","Working","Wrangling","Zesting","Zigzagging",
 ];
 
-// Animation state
-let spinnerInterval = null;
-let timerInterval = null;
-let stalledCheckInterval = null;
-let activityCountdownInterval = null;
-let spinnerFrame = 0;
-let loadingStartTime = 0;
-let lastActivityTime = 0;
 let isStalled = false;
 let workingActive = false;
 let automationActivity = null;
+let awaitingResponse = false;
+let pendingResponseVerb = null;
 
 export function resolveActivityMode(working, activity) {
   if (activity?.mode === "standby" || activity?.mode === "sleeping") {
@@ -1003,7 +1354,11 @@ export function resolveActivityMode(working, activity) {
 }
 
 export function shouldRenderTranscriptActivity(mode) {
-  return mode === "working";
+  return false;
+}
+
+export function shouldShowPendingResponseActivity(mode, waitingForResponse) {
+  return mode === "working" && waitingForResponse;
 }
 
 export function formatCountdownRemaining(endsAt, now = Date.now()) {
@@ -1039,102 +1394,40 @@ function syncActionBtn(mode) {
   if (typeof window.__updateActionBtn === "function") window.__updateActionBtn(mode);
 }
 
-function clearWorkingTimers() {
-  if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
-  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-  if (stalledCheckInterval) { clearInterval(stalledCheckInterval); stalledCheckInterval = null; }
-  isStalled = false;
-}
-
-function clearActivityCountdownTimer() {
-  if (activityCountdownInterval) {
-    clearInterval(activityCountdownInterval);
-    activityCountdownInterval = null;
-  }
-}
-
-function removeActivityElement() {
+function ensureActivityElement() {
   const el = document.getElementById(ACTIVITY_ID);
-  if (el) el.remove();
+  return el instanceof HTMLElement ? el : null;
 }
 
-function renderWorkingIndicator(stream) {
-  const verb = SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)];
-  loadingStartTime = Date.now();
-  lastActivityTime = Date.now();
-  isStalled = false;
-
-  const el = document.createElement("div");
-  el.id = ACTIVITY_ID;
-  el.className = "msg-row loading-row";
-  el.innerHTML = `<span class="tui-spinner">${SPINNER_CYCLE[0]}</span><span class="tui-verb glimmer-text">${esc(verb)}…</span><span class="tui-timer">0s</span>`;
-  stream.appendChild(el);
-  stream.scrollTop = stream.scrollHeight;
-
-  const spinnerEl = el.querySelector(".tui-spinner");
-  const timerEl = el.querySelector(".tui-timer");
-  const loadingEl = el;
-
-  spinnerFrame = 0;
-  spinnerInterval = setInterval(() => {
-    spinnerFrame = (spinnerFrame + 1) % SPINNER_CYCLE.length;
-    if (spinnerEl) spinnerEl.textContent = SPINNER_CYCLE[spinnerFrame];
-  }, 120);
-
-  timerInterval = setInterval(() => {
-    if (timerEl) {
-      const elapsed = Math.floor((Date.now() - loadingStartTime) / 1000);
-      timerEl.textContent = `${elapsed}s`;
-    }
-  }, 1000);
-
-  stalledCheckInterval = setInterval(() => {
-    if (!isStalled && Date.now() - lastActivityTime > 3000) {
-      isStalled = true;
-      if (loadingEl) loadingEl.classList.add("stalled");
-    }
-  }, 120);
+function getPendingResponseVerb() {
+  if (pendingResponseVerb) return pendingResponseVerb;
+  pendingResponseVerb = SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)];
+  return pendingResponseVerb;
 }
 
-function renderAutomationIndicator(stream, activity) {
-  const el = document.createElement("div");
-  el.id = ACTIVITY_ID;
-  el.className = `msg-row automation-activity-row automation-activity-${activity.mode}`;
+function renderPendingResponseActivity() {
+  const el = ensureActivityElement();
+  if (!el) return;
+
+  const toneClass = isStalled ? " is-stalled" : "";
+  const verb = getPendingResponseVerb();
+  el.className = `session-activity${toneClass}`;
   el.innerHTML = `
-    <div class="automation-activity-card">
-      ${renderAutomationIcon(activity.iconVariant, { className: "automation-activity-icon" })}
-      <div class="automation-activity-copy">
-        <span class="automation-activity-label">${esc(activity.label)}</span>
-      </div>
-      <span class="automation-activity-countdown"></span>
-    </div>`;
-  stream.appendChild(el);
-  stream.scrollTop = stream.scrollHeight;
-
-  const countdownEl = el.querySelector(".automation-activity-countdown");
-  const updateCountdown = () => {
-    if (countdownEl) {
-      countdownEl.textContent = formatCountdownRemaining(activity.endsAt);
-    }
-  };
-
-  updateCountdown();
-  activityCountdownInterval = setInterval(updateCountdown, 1000);
+    <span class="session-activity-dot" aria-hidden="true"></span>
+    <span class="session-activity-label">${esc(verb)}…</span>`;
 }
 
 function renderActivityIndicator() {
-  clearWorkingTimers();
-  clearActivityCountdownTimer();
-  removeActivityElement();
-
   const mode = getActivityModeInternal();
   syncActionBtn(mode);
+  const el = ensureActivityElement();
+  if (!el) return;
 
-  const stream = document.getElementById("event-stream");
-  if (!stream) return;
-
-  if (shouldRenderTranscriptActivity(mode)) {
-    renderWorkingIndicator(stream);
+  if (shouldShowPendingResponseActivity(mode, awaitingResponse)) {
+    renderPendingResponseActivity();
+  } else {
+    el.className = "session-activity hidden";
+    el.innerHTML = "";
   }
 }
 
@@ -1146,20 +1439,31 @@ export function setAutomationActivity(activity) {
 export function showLoading() {
   automationActivity = null;
   workingActive = true;
+  awaitingResponse = true;
+  pendingResponseVerb = null;
+  isStalled = false;
   renderActivityIndicator();
 }
 
 export function removeLoading() {
   workingActive = false;
+  awaitingResponse = false;
+  pendingResponseVerb = null;
+  isStalled = false;
+  renderActivityIndicator();
+}
+
+export function hidePendingResponseActivity() {
+  if (!awaitingResponse) return;
+  awaitingResponse = false;
+  isStalled = false;
   renderActivityIndicator();
 }
 
 /** Reset stalled timer — call when SSE events arrive */
 export function refreshLoadingActivity() {
-  lastActivityTime = Date.now();
   if (isStalled) {
     isStalled = false;
-    const loadingEl = document.getElementById(ACTIVITY_ID);
-    if (loadingEl) loadingEl.classList.remove("stalled");
+    renderActivityIndicator();
   }
 }

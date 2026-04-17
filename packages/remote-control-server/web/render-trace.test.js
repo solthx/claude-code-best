@@ -5,6 +5,7 @@ import {
   addToolTraceEntry,
   clearActiveToolTraceHost,
   createToolTraceState,
+  getTraceHostVisibleEntryCount,
 } from "./render.js";
 
 describe("tool trace grouping state", () => {
@@ -86,5 +87,14 @@ describe("tool trace grouping state", () => {
         entryKinds: ["result"],
       },
     ]);
+  });
+
+  test("prefers rendered tool-card count over stale entryCount metadata", () => {
+    expect(
+      getTraceHostVisibleEntryCount({
+        entryCount: 2,
+        panelEl: { childElementCount: 1 },
+      }),
+    ).toBe(1);
   });
 });

@@ -30,6 +30,7 @@ import {
   listSessionSummaries,
   listSessionSummariesByUsername,
   listSessionsByEnvironment,
+  validateWorkerEpoch,
 } from "../services/session";
 import {
   registerEnvironment,
@@ -142,6 +143,37 @@ describe("Session Service", () => {
 
     test("throws for non-existent session", () => {
       expect(() => incrementEpoch("nope")).toThrow("Session not found");
+    });
+  });
+
+  describe("validateWorkerEpoch", () => {
+    test("accepts the current session epoch", () => {
+      const s = createSession({});
+      incrementEpoch(s.id);
+      const result = validateWorkerEpoch(s.id, 1);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.session.id).toBe(s.id);
+    });
+
+    test("rejects stale worker epochs", () => {
+      const s = createSession({});
+      incrementEpoch(s.id);
+      incrementEpoch(s.id);
+      const result = validateWorkerEpoch(s.id, 1);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.status).toBe(409);
+      expect(result.error.type).toBe("stale_worker_epoch");
+    });
+
+    test("rejects missing worker epochs", () => {
+      const s = createSession({});
+      const result = validateWorkerEpoch(s.id, undefined);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.status).toBe(400);
+      expect(result.error.type).toBe("invalid_request");
     });
   });
 
@@ -333,10 +365,14 @@ describe("Transport Service", () => {
         request_id: "req_1",
         approved: true,
         updated_input: { cmd: "ls -la" },
+        updated_permissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
       });
       expect(result.request_id).toBe("req_1");
       expect(result.approved).toBe(true);
       expect(result.updated_input).toEqual({ cmd: "ls -la" });
+      expect(result.updated_permissions).toEqual([
+        { type: "setMode", mode: "acceptEdits", destination: "session" },
+      ]);
     });
 
     test("preserves message field", () => {
@@ -398,6 +434,25 @@ describe("Transport Service", () => {
       expect(result.status).toBe("conversation_cleared");
       expect(result.subtype).toBe("status");
       expect(result.message).toBe("conversation_cleared");
+    });
+
+    test("preserves stream_event metadata for web-side streaming", () => {
+      const event = {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Once upon a time" },
+      };
+      const result = normalizePayload("stream_event", {
+        event,
+        session_id: "session_1",
+        parent_tool_use_id: null,
+        ttftMs: 123,
+      });
+
+      expect(result.event).toEqual(event);
+      expect(result.session_id).toBe("session_1");
+      expect(result.parent_tool_use_id).toBeNull();
+      expect(result.ttftMs).toBe(123);
     });
 
     test("handles undefined payload", () => {
