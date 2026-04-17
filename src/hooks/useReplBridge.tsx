@@ -4,14 +4,22 @@ import { setMainLoopModelOverride } from '../bootstrap/state.js'
 import {
   type BridgePermissionCallbacks,
   type BridgePermissionResponse,
-  isBridgePermissionResponse,
+  normalizeBridgePermissionResponse,
+  parseBridgePermissionResponse,
 } from '../bridge/bridgePermissionCallbacks.js'
+import { getBridgeCommandSafety } from '../bridge/bridgeCommandPolicy.js'
+import { handleRemoteInterrupt } from '../bridge/remoteInterruptHandling.js'
+import {
+  isTranscriptResetResultReady,
+  shouldDeferBridgeResult,
+} from '../bridge/bridgeResultScheduling.js'
+import { useBridgeTaskStatePublisher } from '../bridge/useBridgeTaskStatePublisher.js'
 import { buildBridgeConnectUrl } from '../bridge/bridgeStatusUtil.js'
 import { extractInboundMessageFields } from '../bridge/inboundMessages.js'
 import type { BridgeState, ReplBridgeHandle } from '../bridge/replBridge.js'
 import { setReplBridgeHandle } from '../bridge/replBridgeHandle.js'
 import type { Command } from '../commands.js'
-import { getSlashCommandToolSkills, isBridgeSafeCommand } from '../commands.js'
+import { getSlashCommandToolSkills } from '../commands.js'
 import { getRemoteSessionUrl } from '../constants/product.js'
 import { useNotifications } from '../context/notifications.js'
 import type {
@@ -81,6 +89,8 @@ export function useReplBridge(
   const handleRef = useRef<ReplBridgeHandle | null>(null)
   const teardownPromiseRef = useRef<Promise<void> | undefined>(undefined)
   const lastWrittenIndexRef = useRef(0)
+  const pendingResultAfterFlushRef = useRef(false)
+  const transcriptResetPendingRef = useRef(false)
   // Tracks UUIDs already flushed as initial messages. Persists across
   // bridge reconnections so Bridge #2+ only sends new messages — sending
   // duplicate UUIDs causes the server to kill the WebSocket.
@@ -108,6 +118,10 @@ export function useReplBridge(
   const replBridgeConnected = feature('BRIDGE_MODE')
     ? // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
       useAppState(s => s.replBridgeConnected)
+    : false
+  const replBridgeSessionActive = feature('BRIDGE_MODE')
+    ? // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
+      useAppState(s => s.replBridgeSessionActive)
     : false
   const replBridgeOutboundOnly = feature('BRIDGE_MODE')
     ? // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
@@ -252,9 +266,10 @@ export function useReplBridge(
                 uuid,
                 // skipSlashCommands stays true as defense-in-depth —
                 // processUserInputBase overrides it internally when bridgeOrigin
-                // is set AND the resolved command passes isBridgeSafeCommand.
-                // This keeps exit-word suppression and immediate-command blocks
-                // intact for any code path that checks skipSlashCommands directly.
+                // is set and the resolved command passes the bridge command
+                // policy. This keeps exit-word suppression and immediate-
+                // command blocks intact for any code path that checks
+                // skipSlashCommands directly.
                 skipSlashCommands: true,
                 bridgeOrigin: true,
               })
@@ -381,7 +396,9 @@ export function useReplBridge(
                           // advertising unsafe ones (local-jsx, unallowed local)
                           // would let mobile/web attempt them and hit errors.
                           commands:
-                            commandsRef.current.filter(isBridgeSafeCommand),
+                            commandsRef.current.filter(
+                              cmd => getBridgeCommandSafety(cmd, '').ok,
+                            ),
                           agents: state.agentDefinitions.activeAgents,
                           skills,
                           plugins: [],
@@ -454,25 +471,25 @@ export function useReplBridge(
               )
               return
             }
-            pendingPermissionHandlers.delete(requestId)
-            // Extract the permission decision from the control_response payload
-            const inner = msg.response
-            if (
-              inner.subtype === 'success' &&
-              inner.response &&
-              isBridgePermissionResponse(inner.response)
-            ) {
-              handler(inner.response)
+            const parsed = parseBridgePermissionResponse(msg)
+            if (!parsed) {
+              logForDebugging(
+                `[bridge:repl] Rejecting invalid control_response request_id=${requestId}`,
+              )
             }
+            pendingPermissionHandlers.delete(requestId)
+            handler(
+              parsed ?? normalizeBridgePermissionResponse(msg),
+            )
           }
 
-          const handle = await initReplBridge({
+          const rawHandle = await initReplBridge({
             outboundOnly,
             tags: outboundOnly ? ['ccr-mirror'] : undefined,
             onInboundMessage: handleInboundMessage,
             onPermissionResponse: handlePermissionResponse,
             onInterrupt() {
-              abortControllerRef.current?.abort()
+              handleRemoteInterrupt(abortControllerRef.current)
             },
             onSetModel(model) {
               const resolved = model === 'default' ? null : (model ?? null)
@@ -565,6 +582,16 @@ export function useReplBridge(
             initialName: replBridgeInitialName,
             perpetual,
           })
+          const handle = rawHandle
+            ? {
+                ...rawHandle,
+                markTranscriptReset() {
+                  transcriptResetPendingRef.current = true
+                  pendingResultAfterFlushRef.current = false
+                  lastWrittenIndexRef.current = 0
+                },
+              }
+            : null
           if (cancelled) {
             // Effect was cancelled while initReplBridge was in flight.
             // Tear down the handle to avoid leaking resources (poll loop,
@@ -816,6 +843,8 @@ export function useReplBridge(
           }
         })
         lastWrittenIndexRef.current = 0
+        pendingResultAfterFlushRef.current = false
+        transcriptResetPendingRef.current = false
       }
     }
   }, [
@@ -864,15 +893,78 @@ export function useReplBridge(
 
       if (newMessages.length > 0) {
         handle.writeMessages(newMessages)
+        transcriptResetPendingRef.current = false
+      }
+
+      if (
+        pendingResultAfterFlushRef.current &&
+        isTranscriptResetResultReady(
+          transcriptResetPendingRef.current,
+          messages.length,
+        )
+      ) {
+        transcriptResetPendingRef.current = false
+        pendingResultAfterFlushRef.current = false
+        handle.sendResult()
+        return
+      }
+
+      if (
+        pendingResultAfterFlushRef.current &&
+        !transcriptResetPendingRef.current
+      ) {
+        pendingResultAfterFlushRef.current = false
+        handle.sendResult()
       }
     }
   }, [messages, replBridgeConnected])
 
+  useBridgeTaskStatePublisher({
+    handleRef,
+    replBridgeSessionActive,
+    replBridgeOutboundOnly,
+  })
+
   const sendBridgeResult = useCallback(() => {
     if (feature('BRIDGE_MODE')) {
-      handleRef.current?.sendResult()
+      const handle = handleRef.current
+      if (!handle) {
+        pendingResultAfterFlushRef.current = true
+        return
+      }
+
+      if (
+        isTranscriptResetResultReady(
+          transcriptResetPendingRef.current,
+          messagesRef.current.length,
+        )
+      ) {
+        transcriptResetPendingRef.current = false
+        pendingResultAfterFlushRef.current = false
+        handle.sendResult()
+        return
+      }
+
+      // Message mirroring happens in a separate effect. When the turn completes
+      // before that effect flushes the latest transcript rows, hold the result
+      // so remote state transitions after the final mirrored messages instead
+      // of bouncing back to "running" on local slash commands like /clear.
+      if (
+        transcriptResetPendingRef.current ||
+        shouldDeferBridgeResult({
+          hasHandle: true,
+          isConnected: replBridgeConnected,
+          lastWrittenIndex: lastWrittenIndexRef.current,
+          messageCount: messagesRef.current.length,
+        })
+      ) {
+        pendingResultAfterFlushRef.current = true
+        return
+      }
+
+      handle.sendResult()
     }
-  }, [])
+  }, [replBridgeConnected])
 
   return { sendBridgeResult }
 }

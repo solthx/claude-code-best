@@ -1,9 +1,14 @@
-import { feature } from 'bun:bundle'
 import { z } from 'zod/v4'
 import type { ToolResultBlockParam } from 'src/Tool.js'
 import { buildTool } from 'src/Tool.js'
 import { lazySchema } from 'src/utils/lazySchema.js'
 import { SLEEP_TOOL_NAME, DESCRIPTION, SLEEP_TOOL_PROMPT } from './prompt.js'
+import {
+  notifySleepFinished,
+  notifySleepStarted,
+  shouldInterruptSleep,
+  waitForSleepCompletion,
+} from './sleepControl.js'
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
@@ -42,6 +47,9 @@ export const SleepTool = buildTool({
   isReadOnly() {
     return true
   },
+  interruptBehavior() {
+    return 'cancel'
+  },
 
   userFacingName() {
     return SLEEP_TOOL_NAME
@@ -69,52 +77,25 @@ export const SleepTool = buildTool({
   async call(input: SleepInput, context) {
     // Refuse to sleep when proactive mode is off — prevents the model from
     // re-issuing Sleep after an interruption caused by /proactive disable.
-    if (feature('PROACTIVE') || feature('KAIROS')) {
-      const mod =
-        require('src/proactive/index.js') as typeof import('src/proactive/index.js')
-      if (!mod.isProactiveActive()) {
-        return {
-          data: {
-            slept_seconds: 0,
-            interrupted: true,
-          },
-        }
+    // Also wake early when new work reaches the shared queue so the user does
+    // not wait for the full timer after a remote command arrives.
+    if (shouldInterruptSleep()) {
+      return {
+        data: {
+          slept_seconds: 0,
+          interrupted: true,
+        },
       }
     }
 
     const { duration_seconds } = input
     const startTime = Date.now()
+    const sleepUntil = startTime + duration_seconds * 1000
+
+    notifySleepStarted(sleepUntil)
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, duration_seconds * 1000)
-
-        // Abort via user interrupt
-        context.abortController.signal.addEventListener(
-          'abort',
-          () => {
-            clearTimeout(timer)
-            clearInterval(proactiveCheck)
-            reject(new Error('interrupted'))
-          },
-          { once: true },
-        )
-
-        // Poll proactive state — if deactivated mid-sleep, interrupt early
-        // so the user doesn't have to wait for the full duration.
-        const proactiveCheck =
-          feature('PROACTIVE') || feature('KAIROS')
-            ? setInterval(() => {
-                const mod =
-                  require('src/proactive/index.js') as typeof import('src/proactive/index.js')
-                if (!mod.isProactiveActive()) {
-                  clearTimeout(timer)
-                  clearInterval(proactiveCheck)
-                  reject(new Error('interrupted'))
-                }
-              }, 500)
-            : (null as unknown as ReturnType<typeof setInterval>)
-      })
+      await waitForSleepCompletion(duration_seconds, context.abortController)
       return {
         data: {
           slept_seconds: duration_seconds,
@@ -129,6 +110,8 @@ export const SleepTool = buildTool({
           interrupted: true,
         },
       }
+    } finally {
+      notifySleepFinished()
     }
   },
 })
